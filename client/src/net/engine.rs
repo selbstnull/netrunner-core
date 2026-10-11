@@ -31,7 +31,7 @@ use netrunner_core::rawcast::{RawCastEvent, RawCastFrame};
 use smoltcp::iface::PollResult;
 use smoltcp::phy::ChannelDevice;
 use smoltcp::time::Instant;
-use smoltcp::wire::{IpAddress, IpCidr};
+use smoltcp::wire::{IpAddress, IpCidr, Ipv6Address};
 use smoltcp::{
     iface::{Config, Interface, SocketSet},
     phy::DeviceCapabilities,
@@ -948,6 +948,33 @@ impl Engine {
         self.interface.routes_mut().remove_default_ipv4_route();
     }
 
+    /// The stack's own IPv6 address and its default IPv6 gateway (itself, the same
+    /// trick as the IPv4 side). With `any_ip` this lets the stack take IPv6 flows
+    /// from the TUN, so the apps' IPv6 traffic goes through the tunnel instead of
+    /// around it.
+    pub const STACK_IPV6: Ipv6Address = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
+
+    pub fn enable_ipv6(&mut self) {
+        let mut added = false;
+        self.interface.update_ip_addrs(|addrs| {
+            added = addrs
+                .push(IpCidr::new(IpAddress::Ipv6(Self::STACK_IPV6), 64))
+                .is_ok();
+        });
+        if !added {
+            warn!("IPv6: no room for the stack's IPv6 address; IPv6 stays outside the tunnel stack");
+            return;
+        }
+        self.interface.routes_mut().remove_default_ipv6_route();
+        if let Err(e) = self
+            .interface
+            .routes_mut()
+            .add_default_ipv6_route(Self::STACK_IPV6)
+        {
+            warn!("IPv6: failed to add the default IPv6 route: {:?}", e);
+        }
+    }
+
     pub fn set_default_gateway(
         &mut self,
         gateway: smoltcp::wire::Ipv4Address,
@@ -988,6 +1015,9 @@ pub struct EngineConfig {
     pub transparent_mode: bool,
     /// Шлюз по умолчанию внутри стека.
     pub default_gateway: Ipv4Addr,
+    /// Пропускать ли IPv6 приложений через туннель (стек получает свой IPv6-адрес
+    /// и маршрут по умолчанию). Выключено — IPv6 в стек не попадает.
+    pub ipv6: bool,
     /// Включён ли kill-switch (резать трафик мимо туннеля).
     pub killswitch_enabled: bool,
     /// Приложения в обход туннеля (split-tunneling).
@@ -1052,6 +1082,7 @@ impl EngineConfig {
             any_ip: true,
             transparent_mode: true,
             default_gateway: Ipv4Addr::new(10, 0, 0, 2),
+            ipv6: true,
             killswitch_enabled: true,
             excluded_apps: Vec::new(),
             excluded_domains: Vec::new(),
@@ -1124,6 +1155,11 @@ impl EngineConfig {
         self
     }
 
+    pub fn with_ipv6(mut self, enabled: bool) -> Self {
+        self.ipv6 = enabled;
+        self
+    }
+
     pub fn disable_routing(mut self) -> Self {
         self.setup_routing = false;
         self
@@ -1174,6 +1210,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("any_ip", &self.any_ip)
             .field("transparent_mode", &self.transparent_mode)
             .field("default_gateway", &self.default_gateway)
+            .field("ipv6", &self.ipv6)
             .field("killswitch_enabled", &self.killswitch_enabled)
             .field("excluded_apps", &self.excluded_apps)
             .field("excluded_domains", &self.excluded_domains)
@@ -1428,6 +1465,9 @@ impl EngineBuilder {
             engine.set_transparent_mode();
         }
         engine.set_default_gateway(self.config.default_gateway)?;
+        if self.config.ipv6 {
+            engine.enable_ipv6();
+        }
         engine.activate();
 
         info!(
@@ -1492,5 +1532,103 @@ mod dead_tunnel_tests {
             &mut deadline,
             false
         ));
+    }
+}
+
+
+#[cfg(test)]
+mod ipv6_stack_tests {
+    use super::*;
+    use crate::net::socket_factory::SmolSocketFactory;
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{
+        IpProtocol, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    };
+
+    fn engine() -> Engine {
+        NetworkConfig::init_global(1450);
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = 1450;
+        caps.medium = smoltcp::phy::Medium::Ip;
+        let (tx, _rx_keep) = mpsc::channel::<RawCastFrame>(64);
+        let (_tx_keep, rx) = mpsc::channel::<RawCastFrame>(64);
+        let factory: Arc<dyn SocketProvider> =
+            Arc::new(SmolSocketFactory::new(Arc::new(NetworkConfig::global().clone())));
+        let mut engine = Engine::new(
+            Config::new(smoltcp::wire::HardwareAddress::Ip),
+            caps,
+            DnsHandler::new(".", Vec::new()),
+            tx,
+            rx,
+            factory,
+        );
+        engine.set_any_ip(true);
+        engine.set_transparent_mode();
+        engine
+            .set_default_gateway(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2))
+            .unwrap();
+        engine.activate();
+        engine
+    }
+
+    fn syn(src: Ipv6Address, dst: Ipv6Address) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port: 50000,
+            dst_port: 443,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(1000),
+            ack_number: None,
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: Some(1380),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv6Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut buf = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv6Packet::new_unchecked(&mut buf[..]));
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut buf[ip.buffer_len()..]),
+            &IpAddress::Ipv6(src),
+            &IpAddress::Ipv6(dst),
+            &ChecksumCapabilities::default(),
+        );
+        buf
+    }
+
+    fn answer_to(engine: &mut Engine, packet: Vec<u8>) -> Option<Vec<u8>> {
+        engine
+            .manager
+            .try_create_socket_from_packet(&packet, &mut engine.socket_set);
+        engine.device.push_rx(packet);
+        engine
+            .interface
+            .poll(Engine::current_time(), &mut engine.device, &mut engine.socket_set);
+        engine.device.pop_tx()
+    }
+
+    /// With IPv6 enabled the stack accepts a TCP SYN to an arbitrary IPv6 address
+    /// (the app's own IPv6 traffic) and answers with a SYN-ACK from that address.
+    #[test]
+    fn an_ipv6_syn_to_any_address_is_accepted_when_ipv6_is_enabled() {
+        let mut engine = engine();
+        engine.enable_ipv6();
+        let app = Engine::STACK_IPV6;
+        let server = Ipv6Address::new(0x2a03, 0x2880, 0xf20a, 0xe5, 0xface, 0xb00c, 0, 0x4420);
+
+        let reply = answer_to(&mut engine, syn(app, server)).expect("a SYN-ACK");
+        let ip = Ipv6Packet::new_checked(&reply[..]).expect("IPv6 reply");
+        assert_eq!(ip.src_addr(), server, "the reply comes from the address the app dialed");
+        assert_eq!(ip.dst_addr(), app);
+        let tcp = TcpPacket::new_checked(ip.payload()).expect("TCP");
+        assert!(tcp.syn() && tcp.ack(), "expected SYN-ACK");
     }
 }
