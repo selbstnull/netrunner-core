@@ -50,6 +50,9 @@ pub(crate) struct ExitCaps {
     local_v6: AtomicBool,
     v4_failures: AtomicU8,
     v6_failures: AtomicU8,
+    /// Set once each family has been probed at least once.
+    v4_probed: AtomicBool,
+    v6_probed: AtomicBool,
     peers: DashMap<String, PeerCaps>,
 }
 
@@ -61,6 +64,8 @@ impl Default for ExitCaps {
             local_v6: AtomicBool::new(true),
             v4_failures: AtomicU8::new(0),
             v6_failures: AtomicU8::new(0),
+            v4_probed: AtomicBool::new(false),
+            v6_probed: AtomicBool::new(false),
             peers: DashMap::new(),
         }
     }
@@ -169,13 +174,19 @@ impl ExitCaps {
     }
 
     fn apply_probe(&self, family: Family, reachable: bool) {
-        let (flag, failures) = match family {
-            Family::V4 => (&self.local_v4, &self.v4_failures),
-            Family::V6 => (&self.local_v6, &self.v6_failures),
+        let (flag, failures, probed) = match family {
+            Family::V4 => (&self.local_v4, &self.v4_failures, &self.v4_probed),
+            Family::V6 => (&self.local_v6, &self.v6_failures, &self.v6_probed),
             Family::Name => return,
         };
         let was_up = flag.load(Ordering::Relaxed);
-        let now_up = if reachable {
+        // The very first probe replaces the optimistic default outright: a node
+        // with no IPv6 at all must not keep claiming it for two probe rounds.
+        let first = !probed.swap(true, Ordering::Relaxed);
+        let now_up = if first {
+            failures.store(u8::from(!reachable), Ordering::Relaxed);
+            reachable
+        } else if reachable {
             failures.store(0, Ordering::Relaxed);
             true
         } else {
@@ -238,8 +249,17 @@ mod tests {
     }
 
     #[test]
+    fn the_first_probe_is_taken_at_face_value() {
+        let caps = ExitCaps::default();
+        caps.apply_probe(Family::V6, false);
+        assert!(!caps.local_supports(Family::V6), "no IPv6 on the very first probe means none");
+        assert!(caps.local_supports(Family::V4), "an unprobed family stays optimistic");
+    }
+
+    #[test]
     fn a_family_goes_down_only_after_repeated_failures() {
         let caps = ExitCaps::default();
+        caps.apply_probe(Family::V6, true);
         caps.apply_probe(Family::V6, false);
         assert!(caps.local_supports(Family::V6), "one miss is not an outage");
         caps.apply_probe(Family::V6, false);
