@@ -23,7 +23,10 @@ use netrunner_logger::warn;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{Socket, tcp, udp},
-    wire::{IpAddress, IpListenEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket},
+    wire::{
+        IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
+        UdpPacket,
+    },
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -293,7 +296,9 @@ impl ConnectionManager {
 
         if socket.is_open() {
             let handle = socket_set.add(socket);
-            let (conn, rx_smol, tx_smol, is_saturated) = UdpConnection::new(handle, f.src, f.src_p);
+            let (mut conn, rx_smol, tx_smol, is_saturated) =
+                UdpConnection::new(handle, f.src, f.src_p);
+            conn.set_remote(IpEndpoint::new(f.dst, f.dst_p));
 
             self.tracker
                 .register_udp(handle, socket_id, conn, tx_smol, is_saturated);

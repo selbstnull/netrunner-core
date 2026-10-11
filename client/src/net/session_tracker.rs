@@ -141,6 +141,13 @@ impl SessionTracker {
         self.active_udp.get_mut(&handle)
     }
 
+    /// The ICMP "unreachable" packet for the UDP flow `socket_id` if the tunnel
+    /// closed it before any reply came back (see `UdpConnection::unreachable_packet`).
+    pub fn udp_unreachable_packet(&self, socket_id: u64) -> Option<Vec<u8>> {
+        let handle = self.id_to_handle.get(&socket_id)?;
+        self.active_udp.get(handle)?.unreachable_packet()
+    }
+
     pub fn update_activity(&mut self, handle: SocketHandle) {
         self.last_activity.insert(handle, StdInstant::now());
     }

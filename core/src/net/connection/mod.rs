@@ -18,6 +18,7 @@ mod buftune;
 #[allow(clippy::module_inception)]
 mod connection;
 mod dgram_engine;
+mod dial;
 mod engine;
 mod handler;
 mod muxer;

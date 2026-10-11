@@ -193,6 +193,8 @@ impl Network {
                         Ok(peers) => {
                             mesh.update_peers(peers).await;
                             mesh.probe_peers().await;
+                            mesh.refresh_local_caps().await;
+                            mesh.refresh_peer_caps().await;
                             metrics::gauge!("netrunner_mesh_peers_available")
                                 .set(mesh.peer_count().await as f64);
                         }

@@ -164,6 +164,37 @@ impl MeshPeerSession {
         .await
     }
 
+    /// Asks the peer which address families it can dial. `None` when it does not
+    /// answer (an older node replies with an empty heartbeat) or the session is
+    /// not usable; callers then treat the peer as capable.
+    pub(crate) async fn query_caps(&self) -> Option<(bool, bool)> {
+        use crate::net::family_caps::{ExitCaps, CAPS_REQUEST};
+        if !self.is_usable() {
+            return None;
+        }
+        let stream_id = self.muxer.next_stream_id();
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(2);
+        self.muxer.register_stream_with_backlog_cap(
+            stream_id,
+            stream_tx,
+            crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
+        );
+        let result = async {
+            self.muxer
+                .send_control(stream_id, FrameType::Heartbeat, Bytes::from_static(CAPS_REQUEST))
+                .await
+                .ok()?;
+            let reply = tokio::time::timeout(Duration::from_secs(3), stream_rx.recv())
+                .await
+                .ok()
+                .flatten()?;
+            ExitCaps::parse_reply(&reply)
+        }
+        .await;
+        self.muxer.remove_stream(stream_id);
+        result
+    }
+
     /// Один обмен записями каталога с этим пиром: `Digest` → `Reply` → `Push`.
     /// Возвращает, сколько записей узнали мы. Ничего не знает о маршрутах и
     /// пользовательских потоках — это отдельный короткий поток в той же сессии.

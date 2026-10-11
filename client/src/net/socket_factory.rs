@@ -13,7 +13,7 @@ use netrunner_core::net::{
     BUFFERBLOAT_WARN_THRESHOLD, DNS_PORT, HTTP_ALT_PORT, HTTP_PORT, HTTPS_PORT, ICMP_BUFFER_SIZE,
     ICMP_META_SLOTS, MAX_SOCKETS, NTP_PORT, NetworkConfig, RDP_PORT, RTMP_PORT, SSH_PORT, VNC_PORT,
 };
-use netrunner_logger::{info, warn};
+use netrunner_logger::{debug, info, warn};
 use smoltcp::{
     iface::SocketSet,
     socket::{
@@ -79,6 +79,7 @@ pub trait SocketProvider: Send + Sync {
     fn log_stats(
         &self,
         sockets: &SocketSet,
+        now: smoltcp::time::Instant,
         get_app_pending: &dyn Fn(smoltcp::iface::SocketHandle) -> usize,
     );
 }
@@ -135,6 +136,7 @@ impl SocketProvider for SmolSocketFactory {
     fn log_stats(
         &self,
         sockets: &SocketSet,
+        now: smoltcp::time::Instant,
         get_app_pending: &dyn Fn(smoltcp::iface::SocketHandle) -> usize,
     ) {
         for (handle, socket) in sockets.iter() {
@@ -175,6 +177,7 @@ impl SocketProvider for SmolSocketFactory {
                     tcp_tx_cap / 1024,      // Ушло браузеру (из стека)
                     app_pending_len / 1024  // Ждет входа в стек (из туннеля)
                 );
+                debug!("   ↳ [TCP {}] {}", handle, tcp_socket.diag_summary(now));
 
                 if app_pending_len > BUFFERBLOAT_WARN_THRESHOLD {
                     warn!(

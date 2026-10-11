@@ -182,3 +182,25 @@ async fn a_swarm_node_still_serves_ordinary_clients() {
     }
     assert!(muxer.active_legs_count() >= 1, "клиент подключился к узлу без панели");
 }
+
+/// Two real nodes: A learns over a mesh session that B has no IPv6, and then keeps
+/// IPv6 flows away from it while IPv4 flows may still use it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_learns_a_peers_address_families_over_the_mesh_session() {
+    use crate::net::trace::Family;
+
+    let sw = SwarmKey::from_bytes([5u8; 32]);
+    let a = spawn(1, &sw).await;
+    let b = spawn(2, &sw).await;
+    seed(&a, &b);
+    a.mesh.update_peers(a.dir.peers(unix_now())).await;
+    b.mesh.force_local_family(Family::V6, false);
+
+    let b_id = b.dir.node_id_hex();
+    assert!(a.mesh.peer_supports(&b_id, Family::V6), "unknown peers count as capable");
+
+    a.mesh.refresh_peer_caps().await;
+
+    assert!(!a.mesh.peer_supports(&b_id, Family::V6), "B said it has no IPv6");
+    assert!(a.mesh.peer_supports(&b_id, Family::V4));
+}

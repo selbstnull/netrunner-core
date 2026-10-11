@@ -39,6 +39,7 @@ mod auth;
 mod config;
 mod credit;
 pub mod directory;
+mod family_caps;
 #[cfg(not(target_arch = "wasm32"))]
 mod mesh;
 #[cfg(not(target_arch = "wasm32"))]
@@ -55,6 +56,7 @@ mod mesh_quic;
 mod connection;
 mod constants;
 pub mod diagnostics;
+pub mod trace;
 
 pub(crate) use auth::ERR_MESH_EGRESS_EXHAUSTED;
 pub use auth::{

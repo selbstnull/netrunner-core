@@ -61,6 +61,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::net::diagnostics::{self, DiagnosticsEvent, LegMetrics, TunnelMetrics, DIAG_COUNTERS};
+use crate::net::trace::{self, DialKind, Family, Proto, Route, StreamTotals, StreamTrace};
 use crate::net::INITIAL_RTT_MS;
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
@@ -75,6 +76,8 @@ pub struct LegStats {
     pub tx_bytes: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub rtt_ms: AtomicU32,
+    /// Wall-clock ms at which this leg was registered (for lifetime logging).
+    pub opened_ms: AtomicU64,
     /// Payload bytes accepted by the per-leg data channel but not yet written
     /// by its socket writer.  Unlike `Sender::capacity`, this remains accurate
     /// when messages have different sizes and while the fair writer holds them
@@ -203,16 +206,31 @@ struct CreditState {
     last_grant_ms: AtomicU64,
     /// Поток снят: ждущего отправителя нужно отпустить, чтобы он не завис.
     closed: AtomicBool,
+    /// Wall-clock ms of creation; the origin for `first_down_ms`.
+    created_ms: u64,
+    /// Wall-clock ms of the first Data byte sent down this stream (0 = none yet).
+    first_down_ms: AtomicU64,
+    /// Total ms the sender sat blocked on the window, and how many separate stalls.
+    stall_ms: AtomicU64,
+    stalls: AtomicU32,
+    /// Wall-clock ms of the last window probe (one chunk let through a closed window).
+    last_probe_ms: AtomicU64,
 }
 
 impl CreditState {
     fn new() -> Self {
+        let now = diagnostics::current_timestamp_ms();
         Self {
             limit: AtomicU64::new(u64::MAX),
             sent: AtomicU64::new(0),
             notify: Notify::new(),
-            last_grant_ms: AtomicU64::new(diagnostics::current_timestamp_ms()),
+            last_grant_ms: AtomicU64::new(now),
             closed: AtomicBool::new(false),
+            created_ms: now,
+            first_down_ms: AtomicU64::new(0),
+            stall_ms: AtomicU64::new(0),
+            stalls: AtomicU32::new(0),
+            last_probe_ms: AtomicU64::new(0),
         }
     }
 
@@ -229,6 +247,15 @@ struct StreamSlot {
     stats: Arc<StreamStats>,
     token: CancellationToken,
     backlog: Arc<StreamBacklog>,
+}
+
+/// A stream's trace plus the shared counters its closing line reports. The
+/// `Arc`s outlive the stream's own registry entries, so the totals can still be
+/// read after the slot and the credit state were removed.
+struct TraceEntry {
+    trace: StreamTrace,
+    stats: Arc<StreamStats>,
+    credit: Arc<CreditState>,
 }
 
 /// Одна нога туннеля = одно физическое TCP+TLS-соединение.
@@ -452,6 +479,8 @@ pub struct Muxer {
     udp_flowlets: Arc<DashMap<u32, UdpFlowletState>>,
     /// Время отправки PING по каждой ноге — для измерения RTT по PONG.
     pending_pings: Arc<DashMap<u32, Instant>>,
+    /// Per-stream trace for the closing log line (see `net::trace`).
+    traces: Arc<DashMap<u32, TraceEntry>>,
     /// Генератор `stream_id` (чётность по роли).
     id_gen: Arc<IdGenerator>,
     /// Идентификатор сессии (для логов/топологии).
@@ -539,6 +568,7 @@ impl Muxer {
             credits: Arc::new(DashMap::new()),
             stream_bindings: Arc::new(DashMap::new()),
             udp_flowlets: Arc::new(DashMap::new()),
+            traces: Arc::new(DashMap::new()),
             id_gen: Arc::new(IdGenerator::new(is_client)),
             pending_pings: Arc::new(DashMap::new()),
             session_id: Arc::new(session_id),
@@ -771,7 +801,13 @@ impl Muxer {
                 id: leg_id,
                 control_tx,
                 data_tx,
-                stats: Arc::new(LegStats::default()),
+                stats: {
+                    let stats = LegStats::default();
+                    stats
+                        .opened_ms
+                        .store(diagnostics::current_timestamp_ms(), Ordering::Relaxed);
+                    Arc::new(stats)
+                },
                 max_datagram_payload: 0,
             },
         );
@@ -800,12 +836,18 @@ impl Muxer {
     /// снимает привязки, потом обновляет кэш — чтобы конкурентный `select_leg` не
     /// привязался к эвиктируемой ноге.
     pub fn remove_leg(&self, leg_id: u32, tx: &Sender<MuxMessage>) {
+        self.remove_leg_because(leg_id, tx, "removed");
+    }
+
+    /// Like [`remove_leg`](Self::remove_leg), recording why the leg is going away.
+    pub fn remove_leg_because(&self, leg_id: u32, tx: &Sender<MuxMessage>, reason: &'static str) {
         let should_remove = self
             .legs
             .get(&leg_id)
             .is_some_and(|leg| leg.control_tx.same_channel(tx));
         if should_remove {
             if let Some((_, leg)) = self.legs.remove(&leg_id) {
+                self.log_leg_closed(&leg, reason);
                 self.fold_removed_leg(&leg);
             }
             // Unbind streams BEFORE refreshing the cache so a concurrent
@@ -822,11 +864,45 @@ impl Muxer {
     /// Безусловно удаляет ногу (без сверки канала) — при выходе её движка.
     pub fn force_remove_leg(&self, leg_id: u32) {
         if let Some((_, leg)) = self.legs.remove(&leg_id) {
+            self.log_leg_closed(&leg, "engine_exit");
             self.fold_removed_leg(&leg);
             self.clear_bindings_for_leg(leg_id);
             self.update_legs_cache();
             info!(leg_id, "MUXER: TCP leg force-removed on engine exit");
         }
+    }
+
+    /// One structured line per leg that goes away: why, how long it lived, how
+    /// much it carried, its last RTT and how much was still queued. No peer
+    /// address, only the session's own random id.
+    fn log_leg_closed(&self, leg: &MuxLeg, reason: &'static str) {
+        let age_ms = diagnostics::current_timestamp_ms()
+            .saturating_sub(leg.stats.opened_ms.load(Ordering::Relaxed));
+        let since_pong_ms = {
+            let last = leg.stats.last_pong_ms.load(Ordering::Relaxed);
+            if last == 0 {
+                -1
+            } else {
+                process_uptime_ms().saturating_sub(last) as i64
+            }
+        };
+        metrics::counter!("netrunner_leg_closed_total", "reason" => reason).increment(1);
+        warn!(
+            target: "netrunner_tunnel",
+            session = %self.session_id,
+            leg_id = leg.id,
+            reason,
+            age_ms,
+            tx_bytes = leg.stats.tx_bytes.load(Ordering::Relaxed),
+            rx_bytes = leg.stats.rx_bytes.load(Ordering::Relaxed),
+            rtt_ms = leg.stats.rtt_ms.load(Ordering::Relaxed),
+            since_pong_ms,
+            queued_bytes = leg.stats.queued_data_bytes.load(Ordering::Relaxed),
+            tcp_unacked_bytes = leg.stats.tcp_unacked_bytes.load(Ordering::Relaxed),
+            tcp_retrans = leg.stats.tcp_total_retrans.load(Ordering::Relaxed),
+            legs_left = self.legs.len(),
+            "tunnel leg closed"
+        );
     }
 
     /// Сбрасывает все ноги и привязки (полная остановка туннеля).
@@ -1530,6 +1606,14 @@ impl Muxer {
     fn debit_credit(&self, stream_id: u32, size: usize) {
         if let Some(state) = self.credits.get(&stream_id) {
             state.sent.fetch_add(size as u64, Ordering::AcqRel);
+            if state.first_down_ms.load(Ordering::Relaxed) == 0 {
+                let _ = state.first_down_ms.compare_exchange(
+                    0,
+                    diagnostics::current_timestamp_ms().max(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
         }
     }
 
@@ -1735,9 +1819,87 @@ impl Muxer {
         self.release_stream_state(stream_id);
     }
 
+    /// Starts the trace of a stream a client opened through this node. Call right
+    /// after the stream was registered. Only the address family of the
+    /// destination is kept, never the address.
+    pub fn trace_open(&self, stream_id: u32, proto: Proto, family: Family, strong_privacy: bool) {
+        let stats = self.streams.get(&stream_id).map(|e| e.value().stats.clone());
+        let credit = self.credits.get(&stream_id).map(|e| e.value().clone());
+        if let (Some(stats), Some(credit)) = (stats, credit) {
+            self.traces.insert(
+                stream_id,
+                TraceEntry {
+                    trace: StreamTrace::new(proto, family, strong_privacy),
+                    stats,
+                    credit,
+                },
+            );
+        }
+    }
+
+    /// Fills in the family once the destination is known (an exit hop learns it
+    /// only after opening the capsule).
+    pub fn trace_family(&self, stream_id: u32, family: Family) {
+        if let Some(mut entry) = self.traces.get_mut(&stream_id) {
+            entry.trace.family = family;
+        }
+    }
+
+    pub fn trace_route(&self, stream_id: u32, route: Route) {
+        if let Some(mut entry) = self.traces.get_mut(&stream_id) {
+            entry.trace.route = route;
+        }
+    }
+
+    /// One more exit attempt (the primary dial or a failover).
+    pub fn trace_attempt(&self, stream_id: u32) {
+        if let Some(mut entry) = self.traces.get_mut(&stream_id) {
+            entry.trace.attempts = entry.trace.attempts.saturating_add(1);
+        }
+    }
+
+    /// Records why the stream ended. The first reason wins: a later generic
+    /// cleanup must not overwrite the real cause.
+    pub fn trace_outcome(&self, stream_id: u32, outcome: &'static str) {
+        if let Some(mut entry) = self.traces.get_mut(&stream_id) {
+            entry.trace.outcome.get_or_insert(outcome);
+        }
+    }
+
+    /// A dial attempt failed with `kind`: counts it and remembers the latest kind.
+    pub fn trace_dial_failure(&self, stream_id: u32, kind: DialKind) {
+        if let Some(mut entry) = self.traces.get_mut(&stream_id) {
+            entry.trace.dial_kind = Some(kind);
+            trace::count_dial_failure(entry.trace.proto, entry.trace.family, kind);
+        }
+    }
+
+    /// Family of a traced stream (`None` when it is not traced).
+    pub fn traced_family(&self, stream_id: u32) -> Option<Family> {
+        self.traces.get(&stream_id).map(|e| e.trace.family)
+    }
+
+    fn emit_stream_trace(&self, stream_id: u32) {
+        let Some((_, mut entry)) = self.traces.remove(&stream_id) else {
+            return;
+        };
+        let first = entry.credit.first_down_ms.load(Ordering::Relaxed);
+        if first != 0 {
+            entry.trace.first_byte_ms = Some(first.saturating_sub(entry.credit.created_ms));
+        }
+        let totals = StreamTotals {
+            up_bytes: entry.stats.rx_bytes.load(Ordering::Relaxed),
+            down_bytes: entry.credit.sent.load(Ordering::Relaxed),
+            credit_stall_ms: entry.credit.stall_ms.load(Ordering::Relaxed),
+            credit_stalls: entry.credit.stalls.load(Ordering::Relaxed),
+        };
+        trace::emit_stream_closed(&self.session_id, stream_id, &entry.trace, totals);
+    }
+
     /// Everything about a stream except its receiving half: credit window, leg
     /// binding, UDP flowlet and early-datagram buffer.
     fn release_stream_state(&self, stream_id: u32) {
+        self.emit_stream_trace(stream_id);
         self.drop_credit(stream_id);
         self.stream_bindings.remove(&stream_id);
         self.udp_flowlets.remove(&stream_id);
@@ -1962,22 +2124,69 @@ impl Muxer {
         let Some(state) = self.credits.get(&stream_id).map(|e| e.value().clone()) else {
             return;
         };
+        let mut stalled_since: Option<Instant> = None;
+        let mut warned = false;
         loop {
             if !state.exhausted() || state.closed.load(Ordering::Acquire) {
-                return;
+                break;
             }
-            let since_grant = diagnostics::current_timestamp_ms()
-                .saturating_sub(state.last_grant_ms.load(Ordering::Relaxed));
+            let now_ms = diagnostics::current_timestamp_ms();
+            let since_grant = now_ms.saturating_sub(state.last_grant_ms.load(Ordering::Relaxed));
             if since_grant >= crate::net::CREDIT_STALL_FALLBACK.as_millis() as u64 {
                 warn!(
                     stream_id,
                     "credit gate: no grant for {:?} — sending unrestricted",
                     crate::net::CREDIT_STALL_FALLBACK
                 );
-                return;
+                break;
             }
-            let _ =
-                tokio::time::timeout(crate::net::CREDIT_WAIT_POLL, state.notify.notified()).await;
+            let stalled = *stalled_since.get_or_insert_with(Instant::now);
+            let stalled_for = stalled.elapsed();
+            // Zero-window probe: a window that stays closed must not freeze the
+            // stream for minutes if a grant was lost or the peer is slow to
+            // re-open it. Let one chunk through per probe interval (the window is
+            // soft by up to one chunk anyway); the peer's next grant resumes full
+            // speed. Without this a stalled stream only resumed after
+            // `CREDIT_STALL_FALLBACK`.
+            let probe_ms = crate::net::CREDIT_PROBE_AFTER.as_millis() as u64;
+            if stalled_for.as_millis() as u64 >= probe_ms
+                && now_ms.saturating_sub(state.last_probe_ms.load(Ordering::Relaxed)) >= probe_ms
+            {
+                state.last_probe_ms.store(now_ms, Ordering::Relaxed);
+                metrics::counter!("netrunner_credit_probe_total").increment(1);
+                {
+                    warn!(
+                        target: "netrunner_tunnel",
+                        session = %self.session_id,
+                        stream_id,
+                        stalled_ms = stalled_for.as_millis() as u64,
+                        sent = state.sent.load(Ordering::Relaxed),
+                        limit = state.limit.load(Ordering::Relaxed),
+                        "credit window closed: probing with one chunk"
+                    );
+                }
+                break;
+            }
+            if !warned && stalled_for >= crate::net::CREDIT_STALL_WARN {
+                warned = true;
+                warn!(
+                    target: "netrunner_tunnel",
+                    session = %self.session_id,
+                    stream_id,
+                    stalled_ms = stalled_for.as_millis() as u64,
+                    sent = state.sent.load(Ordering::Relaxed),
+                    limit = state.limit.load(Ordering::Relaxed),
+                    "credit stall: peer is not granting window"
+                );
+            }
+            let wait = crate::net::CREDIT_WAIT_POLL.min(crate::net::CREDIT_PROBE_AFTER / 3);
+            let _ = tokio::time::timeout(wait, state.notify.notified()).await;
+        }
+        if let Some(since) = stalled_since {
+            let ms = since.elapsed().as_millis() as u64;
+            state.stall_ms.fetch_add(ms, Ordering::Relaxed);
+            state.stalls.fetch_add(1, Ordering::Relaxed);
+            metrics::histogram!("netrunner_credit_stall_seconds").record(ms as f64 / 1000.0);
         }
     }
 
@@ -2073,7 +2282,7 @@ impl Muxer {
                         leg_id,
                         "Health check: control channel closed, evicting dead leg"
                     );
-                    self.remove_leg(leg_id, &tx);
+                    self.remove_leg_because(leg_id, &tx, "health_control_closed");
                     self.remove_stream(probe_stream_id);
                     continue;
                 }
@@ -2101,7 +2310,7 @@ impl Muxer {
                         .is_some_and(|l| l.control_tx.same_channel(&tx));
                     if still_same {
                         warn!(leg_id, "❌ TCP Leg Health Check FAIL/Timeout - Evicting");
-                        self.remove_leg(leg_id, &tx);
+                        self.remove_leg_because(leg_id, &tx, "health_check_timeout");
                     } else {
                         netrunner_logger::debug!(
                             leg_id,

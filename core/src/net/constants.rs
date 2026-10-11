@@ -188,6 +188,14 @@ pub const CREDIT_WAIT_POLL: Duration = Duration::from_secs(2);
 /// because of a bug. It is deliberately long: a consumer that merely paused (a
 /// video player with a full buffer) must NOT be mistaken for a broken peer.
 pub const CREDIT_STALL_FALLBACK: Duration = Duration::from_secs(600);
+
+/// A closed credit window is probed with one chunk this often (and for the first
+/// time this long after it closed), so a lost or late grant costs seconds rather
+/// than [`CREDIT_STALL_FALLBACK`].
+pub const CREDIT_PROBE_AFTER: Duration = Duration::from_secs(3);
+
+/// A window closed for this long is logged as a stall.
+pub const CREDIT_STALL_WARN: Duration = Duration::from_secs(2);
 pub const TLS_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SECURE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 pub const FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

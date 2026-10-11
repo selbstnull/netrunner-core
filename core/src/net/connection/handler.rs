@@ -17,17 +17,16 @@ use netrunner_logger::{debug, trace, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::net::{
     connection::{
         bridge::{run_tcp_bridge, run_udp_bridge},
+        dial,
         muxer::Muxer,
     },
+    trace::{target_family, DialKind, Family, Proto, Route},
     MeshRoute, NetworkConfig,
 };
 use crate::nrxp::{Frame, FrameType};
@@ -76,6 +75,7 @@ impl RemoteOpener {
                     .mesh_route
                     .as_ref()
                     .map_or(1, |route| route.remaining_hops);
+                self.muxer.trace_route(stream_id, Route::Onion);
                 tokio::spawn(Self::open_via_onion(
                     self.muxer.clone(),
                     mesh,
@@ -91,6 +91,7 @@ impl RemoteOpener {
             }
         }
         if strong_privacy {
+            self.muxer.trace_outcome(stream_id, "rejected_strong_privacy_no_route");
             self.reject_stream(stream_id, token).await;
             return;
         }
@@ -99,6 +100,7 @@ impl RemoteOpener {
             match registry.pick_for(self.muxer.quota_user_id().as_deref()) {
                 Pick::Local => {}
                 Pick::Via(session) => {
+                    self.muxer.trace_route(stream_id, Route::Reverse);
                     tokio::spawn(Self::open_via_reverse_egress(
                         self.muxer.clone(),
                         session,
@@ -111,6 +113,7 @@ impl RemoteOpener {
                 }
                 // A remote exit is required but unavailable: fail closed, never exit from here.
                 Pick::Refuse => {
+                    self.muxer.trace_outcome(stream_id, "refused_remote_exit_unavailable");
                     self.reject_stream(stream_id, token).await;
                     return;
                 }
@@ -119,6 +122,7 @@ impl RemoteOpener {
         if !self.mesh_peer && self.mesh_route.is_none() {
             if let Some(mesh) = self.mesh.clone() {
                 if mesh.is_direct_output() {
+                    self.muxer.trace_route(stream_id, Route::Local);
                     tokio::spawn(Self::open_local_tcp_with_egress_failover(
                         self.muxer.clone(),
                         mesh,
@@ -131,6 +135,7 @@ impl RemoteOpener {
                 }
             }
         }
+        self.muxer.trace_route(stream_id, Route::Local);
         self.open_tcp(stream_id, target, v_rx, token).await;
     }
 
@@ -145,6 +150,7 @@ impl RemoteOpener {
         // Reverse egress carries TCP only. Never let UDP exit locally while the owner
         // asked for (or currently has) a remote exit.
         if self.egress_policy.is_some() {
+            self.muxer.trace_outcome(stream_id, "rejected_udp_on_egress_dialer");
             self.reject_stream(stream_id, token).await;
             return;
         }
@@ -155,6 +161,7 @@ impl RemoteOpener {
                 Pick::Local
             );
             if remote_exit {
+                self.muxer.trace_outcome(stream_id, "rejected_udp_remote_exit");
                 self.reject_stream(stream_id, token).await;
                 return;
             }
@@ -170,6 +177,7 @@ impl RemoteOpener {
                     .mesh_route
                     .as_ref()
                     .map_or(1, |route| route.remaining_hops);
+                self.muxer.trace_route(stream_id, Route::Onion);
                 tokio::spawn(Self::open_via_onion(
                     self.muxer.clone(),
                     mesh,
@@ -185,12 +193,14 @@ impl RemoteOpener {
             }
         }
         if strong_privacy {
+            self.muxer.trace_outcome(stream_id, "rejected_strong_privacy_no_route");
             self.reject_stream(stream_id, token).await;
             return;
         }
         if !self.mesh_peer && self.mesh_route.is_none() {
             if let Some(mesh) = self.mesh.clone() {
                 if mesh.is_direct_output() {
+                    self.muxer.trace_route(stream_id, Route::Local);
                     tokio::spawn(Self::open_local_udp_with_egress_failover(
                         self.muxer.clone(),
                         mesh,
@@ -203,6 +213,7 @@ impl RemoteOpener {
                 }
             }
         }
+        self.muxer.trace_route(stream_id, Route::Local);
         self.open_udp(stream_id, target, v_rx, token).await;
     }
 
@@ -214,10 +225,25 @@ impl RemoteOpener {
         v_rx: mpsc::Receiver<Bytes>,
         token: CancellationToken,
     ) {
+        muxer.trace_attempt(stream_id);
+        let family = target_family(&target);
+        let local_can_dial = mesh.local_supports(family);
+        if !local_can_dial {
+            // This node has no route for that family: skip the doomed dial and go
+            // straight to an exit that has one.
+            muxer.trace_dial_failure(stream_id, DialKind::NetUnreachable);
+        }
         let stream = tokio::select! {
             _ = token.cancelled() => None,
-            result = tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)) => {
-                result.ok().and_then(Result::ok)
+            _ = std::future::ready(()), if !local_can_dial => None,
+            result = dial::connect_tcp(&target, Duration::from_secs(7)), if local_can_dial => {
+                match result {
+                    Ok((stream, _family)) => Some(stream),
+                    Err(kind) => {
+                        muxer.trace_dial_failure(stream_id, kind);
+                        None
+                    }
+                }
             }
         };
         if let Some(stream) = stream {
@@ -240,10 +266,12 @@ impl RemoteOpener {
             return;
         }
         if token.is_cancelled() {
+            muxer.trace_outcome(stream_id, "cancelled");
             muxer.remove_stream(stream_id);
             return;
         }
 
+        muxer.trace_route(stream_id, Route::Failover);
         let fallback = mesh
             .build_direct_onion_fallback(&target, false, false)
             .await;
@@ -273,38 +301,37 @@ impl RemoteOpener {
         v_rx: mpsc::Receiver<Bytes>,
         token: CancellationToken,
     ) {
-        let address = tokio::select! {
+        muxer.trace_attempt(stream_id);
+        let local_can_dial = mesh.local_supports(target_family(&target));
+        if !local_can_dial {
+            muxer.trace_dial_failure(stream_id, DialKind::NetUnreachable);
+        }
+        let dialed = tokio::select! {
             _ = token.cancelled() => None,
-            result = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&target)) => {
-                result.ok().and_then(Result::ok).and_then(|mut addresses| addresses.next())
-            }
-        };
-        if let Some(address) = address {
-            let bind = if address.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
-            let socket = tokio::select! {
-                _ = token.cancelled() => None,
-                result = UdpSocket::bind(bind) => result.ok(),
-            };
-            if let Some(socket) = socket {
-                if socket.connect(address).await.is_ok() {
-                    tokio::select! {
-                        _ = token.cancelled() => {},
-                        _ = run_udp_bridge(stream_id, socket, muxer.clone(), v_rx) => {},
-                    }
-                    muxer.remove_stream(stream_id);
-                    return;
+            _ = std::future::ready(()), if !local_can_dial => None,
+            result = dial::connect_udp(&target), if local_can_dial => match result {
+                Ok((socket, _family)) => Some(socket),
+                Err(kind) => {
+                    muxer.trace_dial_failure(stream_id, kind);
+                    None
                 }
+            },
+        };
+        if let Some(socket) = dialed {
+            tokio::select! {
+                _ = token.cancelled() => {},
+                _ = run_udp_bridge(stream_id, socket, muxer.clone(), v_rx) => {},
             }
+            muxer.remove_stream(stream_id);
+            return;
         }
         if token.is_cancelled() {
+            muxer.trace_outcome(stream_id, "cancelled");
             muxer.remove_stream(stream_id);
             return;
         }
 
+        muxer.trace_route(stream_id, Route::Failover);
         let fallback = mesh.build_direct_onion_fallback(&target, true, false).await;
         let (fallback, failovers_left) = fallback
             .map(|(fallback, count)| (Some(fallback), count))
@@ -325,6 +352,7 @@ impl RemoteOpener {
     }
 
     async fn reject_stream(&self, stream_id: u32, token: CancellationToken) {
+        self.muxer.trace_outcome(stream_id, "rejected");
         if !token.is_cancelled() {
             let _ = self
                 .muxer
@@ -369,6 +397,7 @@ impl RemoteOpener {
                     Some(slot) => Some(slot),
                     None => {
                         warn!(stream_id, "⚠️ [Egress] flow limit reached, refusing");
+                        muxer.trace_outcome(stream_id, "refused_flow_limit");
                         let _ = muxer
                             .send_control(stream_id, FrameType::Close, Bytes::new())
                             .await;
@@ -384,16 +413,25 @@ impl RemoteOpener {
             // хранить нигде. `stream_id` достаточно для локальной корреляции.
             debug!(stream_id, "🌐 [Remote] Connecting");
             let start = Instant::now();
+            muxer.trace_attempt(stream_id);
 
             tokio::select! {
                 _ = token.cancelled() => {
                     debug!(stream_id, "🔪 Target connection cancelled by Eviction");
+                    muxer.trace_outcome(stream_id, "cancelled");
+                    muxer.remove_stream(stream_id);
                     return;
                 }
-                connect_res = tokio::time::timeout(Duration::from_secs(7), async {
+                connect_res = tokio::time::timeout(Duration::from_secs(8), async {
                     match &egress_policy {
-                        Some(runtime) => runtime.policy.connect(&target).await,
-                        None => TcpStream::connect(&target).await,
+                        Some(runtime) => runtime
+                            .policy
+                            .connect(&target)
+                            .await
+                            .map_err(|error| DialKind::from_io(&error)),
+                        None => dial::connect_tcp(&target, Duration::from_secs(7))
+                            .await
+                            .map(|(stream, _family)| stream),
                     }
                 }) => {
                     match connect_res {
@@ -437,8 +475,19 @@ impl RemoteOpener {
                                 .send_control(stream_id, FrameType::Close, Bytes::new())
                                 .await;
                         }
-                        _ => {
-                            warn!(stream_id, "❌ [Remote] Target connection failed");
+                        failed => {
+                            let kind = match failed {
+                                Ok(Err(kind)) => kind,
+                                _ => DialKind::Timeout,
+                            };
+                            muxer.trace_dial_failure(stream_id, kind);
+                            muxer.trace_outcome(stream_id, "dial_failed");
+                            warn!(
+                                stream_id,
+                                dial = kind.as_str(),
+                                elapsed_ms = start.elapsed().as_millis() as u64,
+                                "❌ [Remote] Target connection failed"
+                            );
                             let _ = muxer.send_control(stream_id, FrameType::Close, Bytes::new()).await;
                         }
                     }
@@ -473,44 +522,47 @@ impl RemoteOpener {
             }
 
             debug!(stream_id, "🚀 [Remote] Binding UDP");
-            tokio::select! {
-                _ = token.cancelled() => { return; }
-                _ = async {
-                    let resolved = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        tokio::net::lookup_host(&target),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|result| result.ok())
-                    .and_then(|mut addresses| addresses.next());
-                    if let Some(address) = resolved {
-                        let bind = if address.is_ipv4() {
-                            "0.0.0.0:0"
-                        } else {
-                            "[::]:0"
-                        };
-                        if let Ok(socket) = UdpSocket::bind(bind).await {
-                            if socket.connect(address).await.is_ok() {
-                                if mesh_peer {
-                                    let ready = if mesh2_peer || self_mesh_onion_peer {
-                                        crate::net::MESH_ROUTE_READY
-                                    } else {
-                                        b"PONG"
-                                    };
-                                    let _ = muxer
-                                        .send_control(
-                                            stream_id,
-                                            FrameType::Heartbeat,
-                                            Bytes::from_static(ready),
-                                        )
-                                        .await;
-                                }
-                                run_udp_bridge(stream_id, socket, muxer.clone(), v_rx).await;
-                            }
-                        }
+            muxer.trace_attempt(stream_id);
+            let mut connected = false;
+            let dialed = tokio::select! {
+                _ = token.cancelled() => {
+                    muxer.trace_outcome(stream_id, "cancelled");
+                    muxer.remove_stream(stream_id);
+                    return;
+                }
+                result = dial::connect_udp(&target) => match result {
+                    Ok((socket, _family)) => Some(socket),
+                    Err(kind) => {
+                        muxer.trace_dial_failure(stream_id, kind);
+                        None
                     }
-                } => {}
+                },
+            };
+            if let Some(socket) = dialed {
+                connected = true;
+                if mesh_peer {
+                    let ready = if mesh2_peer || self_mesh_onion_peer {
+                        crate::net::MESH_ROUTE_READY
+                    } else {
+                        b"PONG"
+                    };
+                    let _ = muxer
+                        .send_control(stream_id, FrameType::Heartbeat, Bytes::from_static(ready))
+                        .await;
+                }
+                tokio::select! {
+                    _ = token.cancelled() => {}
+                    _ = run_udp_bridge(stream_id, socket, muxer.clone(), v_rx) => {}
+                }
+            }
+            if !connected {
+                // The client's UDP flow used to be left waiting for a Close that never
+                // came, so an app falling back from QUIC only did so after its own
+                // handshake timeout.
+                muxer.trace_outcome(stream_id, "dial_failed");
+                let _ = muxer
+                    .send_control(stream_id, FrameType::Close, Bytes::new())
+                    .await;
             }
             muxer.remove_stream(stream_id);
         });
@@ -550,12 +602,18 @@ impl RemoteOpener {
                 .await
             else {
                 metrics::counter!("netrunner_mesh_egress_failover_exhausted_total").increment(1);
+                ingress_muxer.trace_outcome(ingress_stream_id, "no_egress_candidate");
                 warn!(
                     stream_id = ingress_stream_id,
+                    family = ingress_muxer
+                        .traced_family(ingress_stream_id)
+                        .map(Family::as_str)
+                        .unwrap_or("unknown"),
                     "mesh route setup has no unused egress candidate"
                 );
                 break;
             };
+            ingress_muxer.trace_attempt(ingress_stream_id);
             let attempt_cancel = token.child_token();
             let attempt_call_cancel = attempt_cancel.clone();
             let attempt_mesh = mesh.clone();
@@ -587,6 +645,7 @@ impl RemoteOpener {
                     late_session.muxer.remove_stream(late_stream_id);
                 }
                 if !token.is_cancelled() {
+                    ingress_muxer.trace_outcome(ingress_stream_id, "route_setup_deadline");
                     metrics::counter!("netrunner_mesh_onion_route_failures_total").increment(1);
                     warn!(
                         stream_id = ingress_stream_id,
@@ -612,13 +671,19 @@ impl RemoteOpener {
                     // The preselected chain's bounded egress budget is spent.
                     // Preserve the explicit exhaustion result instead of
                     // silently starting a fresh chain for the same flow.
+                    ingress_muxer.trace_outcome(ingress_stream_id, "egress_exhausted");
                     warn!(
                         stream_id = ingress_stream_id,
+                        family = ingress_muxer
+                            .traced_family(ingress_stream_id)
+                            .map(Family::as_str)
+                            .unwrap_or("unknown"),
                         "mesh egress failover chain exhausted before destination CONNECT"
                     );
                     break;
                 }
                 Err(error) if error.code != netrunner_logger::ERR_INFRA_TIMEOUT => {
+                    ingress_muxer.trace_outcome(ingress_stream_id, "route_rejected");
                     break;
                 }
                 Err(_) => {
@@ -1126,6 +1191,7 @@ async fn fail_mesh_stream_exhausted(
     token: CancellationToken,
     propagate_marker: bool,
 ) {
+    muxer.trace_outcome(stream_id, "egress_exhausted");
     if !token.is_cancelled() {
         if propagate_marker {
             let _ = muxer
@@ -1137,6 +1203,14 @@ async fn fail_mesh_stream_exhausted(
                 .await;
         }
         metrics::counter!("netrunner_mesh_egress_failover_exhausted_total").increment(1);
+        let family = muxer.traced_family(stream_id).map(Family::as_str).unwrap_or("unknown");
+        warn!(
+            target: "netrunner_tunnel",
+            session = %muxer.session_id(),
+            stream_id,
+            family,
+            "mesh egress exhausted: no exit could dial the destination"
+        );
     }
     close_mesh_stream(muxer, stream_id, token).await;
 }
@@ -1292,14 +1366,22 @@ async fn run_mesh_onion_exit(
     fallback: Option<crate::net::mesh_onion::OnionFallback>,
     failovers_left: u8,
 ) {
+    // This node is the exit: the destination is known here, so record its
+    // family (only the family) and count the dial.
+    muxer.trace_family(stream_id, target_family(&target));
+    muxer.trace_attempt(stream_id);
     if is_udp {
-        let address = tokio::select! {
+        let dialed = tokio::select! {
             _ = token.cancelled() => None,
-            result = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(&target)) => {
-                result.ok().and_then(Result::ok).and_then(|mut addresses| addresses.next())
-            }
+            result = dial::connect_udp(&target) => match result {
+                Ok((socket, _family)) => Some(socket),
+                Err(kind) => {
+                    muxer.trace_dial_failure(stream_id, kind);
+                    None
+                }
+            },
         };
-        let Some(address) = address else {
+        let Some(socket) = dialed else {
             if token.is_cancelled() {
                 close_mesh_stream(muxer, stream_id, token).await;
             } else {
@@ -1319,51 +1401,6 @@ async fn run_mesh_onion_exit(
             }
             return;
         };
-        let bind = if address.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        let socket = tokio::select! {
-            _ = token.cancelled() => None,
-            result = UdpSocket::bind(bind) => result.ok(),
-        };
-        let Some(socket) = socket else {
-            if token.is_cancelled() {
-                close_mesh_stream(muxer, stream_id, token).await;
-            } else {
-                run_mesh_onion_failover(
-                    mesh,
-                    muxer,
-                    stream_id,
-                    v_rx,
-                    token,
-                    is_udp,
-                    strong_privacy,
-                    fallback,
-                    failovers_left,
-                    true,
-                )
-                .await;
-            }
-            return;
-        };
-        if socket.connect(address).await.is_err() {
-            run_mesh_onion_failover(
-                mesh,
-                muxer,
-                stream_id,
-                v_rx,
-                token,
-                is_udp,
-                strong_privacy,
-                fallback,
-                failovers_left,
-                true,
-            )
-            .await;
-            return;
-        }
         if muxer
             .send_control(
                 stream_id,
@@ -1470,8 +1507,14 @@ async fn run_mesh_onion_exit(
     } else {
         let stream = tokio::select! {
             _ = token.cancelled() => None,
-            result = tokio::time::timeout(Duration::from_secs(7), TcpStream::connect(&target)) => {
-                result.ok().and_then(Result::ok)
+            result = dial::connect_tcp(&target, Duration::from_secs(7)) => {
+                match result {
+                    Ok((stream, _family)) => Some(stream),
+                    Err(kind) => {
+                        muxer.trace_dial_failure(stream_id, kind);
+                        None
+                    }
+                }
             }
         };
         let Some(stream) = stream else {
@@ -1621,6 +1664,8 @@ async fn run_mesh_onion_failover(
     let Some(fallback) = fallback.filter(|_| failovers_left > 0) else {
         warn!(
             stream_id,
+            family = muxer.traced_family(stream_id).map(Family::as_str).unwrap_or("unknown"),
+            failovers_left,
             "mesh egress failover chain is exhausted; no unused next egress is available"
         );
         fail_mesh_stream_exhausted(muxer, stream_id, token, send_ready_to_upstream).await;
@@ -1637,6 +1682,7 @@ async fn run_mesh_onion_failover(
         return;
     }
     metrics::counter!("netrunner_mesh_egress_failover_attempts_total").increment(1);
+    muxer.trace_attempt(stream_id);
     match mesh
         .connect_onion_stream(
             &fallback.peer,
@@ -1723,6 +1769,18 @@ impl StreamHandler {
     /// arrived on (see `Muxer::send_control_on_leg`), which is why this is separate
     /// from `handle`: the leg reader knows the leg, the handler does not.
     pub(crate) fn heartbeat_reply(&self, payload: &[u8]) -> Option<Bytes> {
+        if payload == crate::net::family_caps::CAPS_REQUEST {
+            // A peer asks which address families this node can dial. Only an
+            // exit-capable (server role) node with a mesh answers it; anyone else
+            // falls back to the generic reply an unknown payload gets.
+            return self.opener.as_ref().map(|opener| {
+                opener
+                    .mesh
+                    .as_ref()
+                    .map(|mesh| Bytes::from(mesh.local_caps_reply()))
+                    .unwrap_or_default()
+            });
+        }
         if payload == b"PING" {
             let response: &'static [u8] = if self
                 .opener
@@ -1738,6 +1796,7 @@ impl StreamHandler {
             || payload == crate::net::MESH_ROUTE_READY
             || payload == crate::net::MESH_ONION_READY
             || payload == crate::net::MESH_EGRESS_EXHAUSTED
+            || payload.starts_with(crate::net::family_caps::CAPS_REPLY_PREFIX)
         {
             None
         } else if self.opener.is_some() {
@@ -1811,6 +1870,7 @@ impl StreamHandler {
                     || payload == crate::net::MESH_ROUTE_READY
                     || payload == crate::net::MESH_ONION_READY
                     || payload == crate::net::MESH_EGRESS_EXHAUSTED
+                    || payload.starts_with(crate::net::family_caps::CAPS_REPLY_PREFIX)
                 {
                     trace!(stream_id, "🤝 [Tunnel] PONG received");
                     self.muxer.dispatch_to_local(stream_id, frame.payload);
@@ -1973,6 +2033,13 @@ impl StreamHandler {
                 v_tx,
                 crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
             );
+            // Only the address family of `target` is recorded, never the address.
+            self.muxer.trace_open(
+                stream_id,
+                if is_udp { Proto::Udp } else { Proto::Tcp },
+                target_family(&target),
+                strong_privacy,
+            );
 
             if is_udp {
                 opener
@@ -2006,6 +2073,15 @@ impl StreamHandler {
                 v_tx,
                 crate::net::SERVER_STREAM_BACKLOG_MAX_BYTES,
             );
+            // This node is a hop/exit for a flow whose destination is sealed in the
+            // capsule: the family is filled in once the capsule is opened.
+            self.muxer.trace_open(
+                stream_id,
+                if is_udp { Proto::Udp } else { Proto::Tcp },
+                Family::Name,
+                true,
+            );
+            self.muxer.trace_route(stream_id, Route::Relay);
             opener
                 .open_mesh_onion(stream_id, capsule, v_rx, cancel_token, is_udp)
                 .await;

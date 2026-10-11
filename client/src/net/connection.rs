@@ -497,7 +497,16 @@ pub struct UdpConnection {
     last_client_endpoint: Option<IpEndpoint>,
     /// Время последней активности (для idle-таймаута).
     last_activity: std::time::Instant,
+    /// Адрес/порт, куда приложение шлёт датаграммы (удалённая сторона потока).
+    remote: Option<IpEndpoint>,
+    /// Пришёл ли хоть один ответ из туннеля.
+    received_any: bool,
+    created: std::time::Instant,
 }
+
+/// A stream the tunnel closes within this long of opening without a single reply
+/// failed to connect, as opposed to a flow that simply went idle.
+const UDP_FAILED_OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl UdpConnection {
     pub fn new(
@@ -515,8 +524,28 @@ impl UdpConnection {
             core,
             last_client_endpoint: Some(IpEndpoint::new(client_addr, client_port)),
             last_activity: std::time::Instant::now(),
+            remote: None,
+            received_any: false,
+            created: std::time::Instant::now(),
         };
         (conn, rx_from_smol, tx_to_smol, is_saturated)
+    }
+
+    /// Remembers where the app is sending, for the ICMP answer to a failed open.
+    pub fn set_remote(&mut self, remote: IpEndpoint) {
+        self.remote = Some(remote);
+    }
+
+    /// The ICMP "port unreachable" to give the app when the tunnel closed this
+    /// flow before it ever got a reply: that is how a real network reports a UDP
+    /// destination it cannot reach, and it makes a QUIC client fall back to TCP
+    /// immediately instead of retransmitting into silence until its handshake
+    /// timeout. `None` for flows that did get replies or only went idle.
+    pub fn unreachable_packet(&self) -> Option<Vec<u8>> {
+        if self.received_any || self.created.elapsed() > UDP_FAILED_OPEN_WINDOW {
+            return None;
+        }
+        crate::net::icmp_error::udp_port_unreachable(self.last_client_endpoint?, self.remote?)
     }
 
     pub fn has_client(&self, port: u16) -> bool {
@@ -531,15 +560,21 @@ impl UdpConnection {
 
         if socket.can_recv() {
             while let Ok((data, metadata)) = socket.recv(timestamp) {
-                if let IpAddress::Ipv4(ip) = metadata.endpoint.addr {
-                    self.last_client_endpoint = Some(metadata.endpoint);
-                    let target_ip = ip;
-                    let target_port = metadata.endpoint.port;
-                    let payload = (Bytes::copy_from_slice(data), target_ip, target_port);
+                // IPv6 datagrams used to be dropped here without a trace, so an app
+                // using QUIC over IPv6 got silence. The frame header only has room
+                // for an IPv4 address and the node ignores it for UDP data anyway
+                // (the payload is all that travels), so IPv6 carries the
+                // unspecified address.
+                let target_ip = match metadata.endpoint.addr {
+                    IpAddress::Ipv4(ip) => ip,
+                    IpAddress::Ipv6(_) => std::net::Ipv4Addr::UNSPECIFIED,
+                };
+                self.last_client_endpoint = Some(metadata.endpoint);
+                let target_port = metadata.endpoint.port;
+                let payload = (Bytes::copy_from_slice(data), target_ip, target_port);
 
-                    if self.core.tx.try_send(payload).is_ok() {
-                        self.last_activity = std::time::Instant::now();
-                    }
+                if self.core.tx.try_send(payload).is_ok() {
+                    self.last_activity = std::time::Instant::now();
                 }
             }
         }
@@ -548,6 +583,7 @@ impl UdpConnection {
             while socket.can_send() {
                 match self.core.rx.try_recv() {
                     Ok(data) => {
+                        self.received_any = true;
                         if let Err(e) = socket.send_slice(&data, client_endpoint) {
                             debug!("Dropped UDP packet: {:?}", e);
                         } else {

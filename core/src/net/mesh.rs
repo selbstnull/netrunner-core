@@ -28,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::connection::{mesh_process_uptime_ms, ClientHandler, MeshPeerSession, Muxer};
 use super::mesh_onion::{OnionFallback, OnionInstruction, MAX_EGRESS_FAILOVERS};
+use super::family_caps::ExitCaps;
+use super::trace::{target_family, Family};
 use super::{MeshPeer, MeshRoute, MeshRouteSelection, MAX_MESH_HOPS};
 use crate::nrxp::FrameType;
 
@@ -126,6 +128,8 @@ pub struct NodeMesh {
     /// записями с соседями. См. [`gossip_round`](Self::gossip_round).
     directory: std::sync::OnceLock<Arc<crate::net::directory::Directory>>,
     cover_tasks: Mutex<HashMap<String, Arc<CoverState>>>,
+    /// Which address families this node and its peers can dial.
+    caps: ExitCaps,
 }
 
 impl NodeMesh {
@@ -163,11 +167,57 @@ impl NodeMesh {
             mixer: OnceCell::new(),
             directory: std::sync::OnceLock::new(),
             cover_tasks: Mutex::new(HashMap::new()),
+            caps: ExitCaps::default(),
         }
     }
 
     pub fn local_node_id(&self) -> &str {
         &self.local_node_id
+    }
+
+    /// Whether this node can dial destinations of `family` itself.
+    pub(crate) fn local_supports(&self, family: Family) -> bool {
+        self.caps.local_supports(family)
+    }
+
+    /// Whether `node_id` can act as an exit for `family` (unknown = yes).
+    pub(crate) fn peer_supports(&self, node_id: &str, family: Family) -> bool {
+        self.caps.peer_supports(node_id, family)
+    }
+
+    /// `CAPS:v4=..;v6=..` describing this node, the answer to a peer's `CAPS?`.
+    pub(crate) fn local_caps_reply(&self) -> Vec<u8> {
+        self.caps.local_reply()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_local_family(&self, family: Family, up: bool) {
+        for _ in 0..2 {
+            self.caps.force_probe_result(family, up);
+        }
+    }
+
+    /// Re-probes this node's own IPv4/IPv6 reachability.
+    pub async fn refresh_local_caps(&self) {
+        self.caps.probe_local().await;
+    }
+
+    /// Asks peers whose capability is unknown or getting old. Cheap: one
+    /// `Heartbeat` frame on an already pooled session, at most every few minutes.
+    pub async fn refresh_peer_caps(&self) {
+        let peers = self.peers.read().await.clone();
+        let token = self.onion_auth_token();
+        for peer in peers {
+            if !self.caps.peer_caps_stale(&peer.node_id) {
+                continue;
+            }
+            let Ok(session) = self.peer_session(&peer, &token, None).await else {
+                continue;
+            };
+            if let Some((v4, v6)) = session.query_caps().await {
+                self.caps.set_peer(&peer.node_id, v4, v6);
+            }
+        }
     }
 
     pub(crate) fn is_direct_output(&self) -> bool {
@@ -318,6 +368,21 @@ impl NodeMesh {
         if all_candidates.is_empty() {
             return None;
         }
+        // The exit is the node that dials the destination, so it has to be able to
+        // reach the destination's address family. Relays do not.
+        let family = target_family(target);
+        let exit_ok = |peer: &MeshPeer| self.caps.peer_supports(&peer.node_id, family);
+        if !all_candidates.iter().any(&exit_ok) {
+            metrics::counter!("netrunner_mesh_no_exit_for_family_total", "family" => family.as_str())
+                .increment(1);
+            tracing::warn!(
+                target: "netrunner_tunnel",
+                family = family.as_str(),
+                candidates = all_candidates.len(),
+                "no mesh peer can act as an exit for this address family"
+            );
+            return None;
+        }
 
         // Prefer measured peers for the primary route, while keeping unprobed
         // peers available as the encrypted egress fallback chain. This lets a
@@ -347,6 +412,21 @@ impl NodeMesh {
             return None;
         }
         route_candidates.truncate(relay_count);
+        if route_candidates.last().is_some_and(|last| !exit_ok(last)) {
+            let last_index = route_candidates.len() - 1;
+            if let Some(position) = route_candidates.iter().position(&exit_ok) {
+                route_candidates.swap(position, last_index);
+            } else if let Some(replacement) = all_candidates.iter().find(|peer| {
+                exit_ok(peer)
+                    && !route_candidates
+                        .iter()
+                        .any(|chosen| chosen.node_id.eq_ignore_ascii_case(&peer.node_id))
+            }) {
+                route_candidates[last_index] = replacement.clone();
+            }
+            metrics::counter!("netrunner_mesh_exit_reselected_for_family_total", "family" => family.as_str())
+                .increment(1);
+        }
         let selected_ids: std::collections::HashSet<_> = route_candidates
             .iter()
             .map(|peer| peer.node_id.to_ascii_lowercase())
@@ -354,6 +434,7 @@ impl NodeMesh {
         let backup_candidates: Vec<_> = all_candidates
             .into_iter()
             .filter(|peer| !selected_ids.contains(&peer.node_id.to_ascii_lowercase()))
+            .filter(|peer| exit_ok(peer))
             .collect();
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -1001,7 +1082,16 @@ impl NodeMesh {
             egress_node_id: None,
             visited: vec![self.local_node_id.clone()],
         };
-        let peers = unique_mesh_peers(self.peers_for_route(&route).await);
+        let family = target_family(target);
+        let peers: Vec<_> = unique_mesh_peers(self.peers_for_route(&route).await)
+            .into_iter()
+            .filter(|peer| self.caps.peer_supports(&peer.node_id, family))
+            .collect();
+        if peers.is_empty() {
+            metrics::counter!("netrunner_mesh_no_exit_for_family_total", "family" => family.as_str())
+                .increment(1);
+            return None;
+        }
         let expires_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()?
@@ -2250,6 +2340,84 @@ mod tests {
         assert!(mesh.route_via_peer(&next, "peer-a").is_none());
         assert!(mesh.route_via_peer(&next, "ingress").is_none());
     }
+
+    fn real_peer(node_id: &str, octet: u8) -> MeshPeer {
+        let (_, public) = X25519HkdfSha256::gen_keypair();
+        let mut peer = peer(node_id, &format!("192.0.2.{octet}"), 443);
+        peer.nrxp_static_public = hex::encode(public.to_bytes().as_slice());
+        peer
+    }
+
+    async fn mesh_with_family_peers(no_v6: &[&str], all: &[&str]) -> NodeMesh {
+        let peers: Vec<_> = all
+            .iter()
+            .enumerate()
+            .map(|(i, id)| real_peer(id, i as u8 + 2))
+            .collect();
+        let mesh = mesh_with_healthy_peers(2, peers).await;
+        for id in all {
+            mesh.caps.set_peer(id, true, !no_v6.contains(id));
+        }
+        mesh
+    }
+
+    /// An IPv6 flow must never be handed to an exit without IPv6, neither as the
+    /// primary exit nor as one of the backups sealed into its capsule.
+    #[tokio::test]
+    async fn a_v6_flow_is_never_routed_to_an_exit_without_ipv6() {
+        let mesh = mesh_with_family_peers(&["p0", "p1"], &["p0", "p1", "p2", "p3"]).await;
+        for _ in 0..60 {
+            let (first, _capsule) = mesh
+                .build_onion_route("[2001:db8::1]:443", false, false, &[], 2)
+                .await
+                .expect("two peers can dial IPv6");
+            assert!(
+                first.node_id == "p2" || first.node_id == "p3",
+                "the exit was {}",
+                first.node_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_v6_flow_without_any_capable_exit_builds_no_route() {
+        let mesh = mesh_with_family_peers(&["p0", "p1"], &["p0", "p1"]).await;
+        assert!(mesh
+            .build_onion_route("[2001:db8::1]:443", false, false, &[], 2)
+            .await
+            .is_none());
+        assert!(mesh
+            .build_direct_onion_fallback("[2001:db8::1]:443", false, false)
+            .await
+            .is_none());
+    }
+
+    /// Lacking IPv6 must not stop IPv4 flows from using the same peers.
+    #[tokio::test]
+    async fn a_v4_flow_still_uses_exits_without_ipv6() {
+        let mesh = mesh_with_family_peers(&["p0", "p1"], &["p0", "p1"]).await;
+        assert!(mesh
+            .build_onion_route("192.0.2.77:443", false, false, &[], 2)
+            .await
+            .is_some());
+        assert!(mesh
+            .build_direct_onion_fallback("192.0.2.77:443", false, false)
+            .await
+            .is_some());
+    }
+
+    /// The backup chain sealed for a v6 flow only names peers that can dial v6.
+    #[tokio::test]
+    async fn the_backup_chain_for_a_v6_flow_only_names_capable_exits() {
+        let mesh = mesh_with_family_peers(&["p0", "p1", "p2"], &["p0", "p1", "p2", "p3", "p4"]).await;
+        let (fallback, count) = mesh
+            .build_direct_onion_fallback("[2001:db8::1]:443", false, false)
+            .await
+            .expect("two peers can dial IPv6");
+        assert_eq!(count, 2, "only p3 and p4 may be backups");
+        assert!(fallback.peer.node_id == "p3" || fallback.peer.node_id == "p4");
+    }
+
 }
 
 fn tracing_debug_gossip_failure(peer: &MeshPeer, error: &str) {

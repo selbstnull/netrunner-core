@@ -133,6 +133,9 @@ pub struct Engine {
     tun_rx: Option<mpsc::Receiver<Vec<u8>>>,
     /// Bounded channel from engine loop to TUN writer task.
     tun_tx: mpsc::Sender<Vec<u8>>,
+    /// Packets the stack makes up itself (ICMP errors for UDP flows the tunnel
+    /// could not open), written to the TUN after the smoltcp output.
+    extra_tun_out: std::collections::VecDeque<Vec<u8>>,
     rx_from_tunnel: Option<mpsc::Receiver<RawCastFrame>>,
     factory: Arc<dyn SocketProvider>,
     stats: TrafficCounter,
@@ -231,6 +234,7 @@ impl Engine {
             diag_outbox: std::collections::VecDeque::new(),
             diag_last_by_kind: std::collections::HashMap::new(),
             pending_download: std::collections::HashMap::new(),
+            extra_tun_out: std::collections::VecDeque::new(),
             dl_dispatched: 0,
             dl_dropped_stuck: 0,
             dl_recv_closed: 0,
@@ -435,6 +439,7 @@ impl Engine {
             while let Ok(frame) = rx_tunnel.try_recv() {
                 work_done = true;
                 if frame.event == RawCastEvent::Close {
+                    self.queue_unreachable_for_failed_udp(frame.socket_id);
                     self.on_download_close(frame.socket_id, &mut local_cache, &inbound_map);
                 } else if frame.event == RawCastEvent::Data {
                     self.route_download(
@@ -499,6 +504,13 @@ impl Engine {
                     None => break,
                 }
             }
+            while self.tun_tx.capacity() > 0 {
+                let Some(pkt) = self.extra_tun_out.pop_front() else {
+                    break;
+                };
+                let _ = self.tun_tx.try_send(pkt);
+                work_done = true;
+            }
 
             // ── 5. Stats logging ─────────────────────────────────────────
             // Сводки считаются вне макросов (обход сокетов, суммы по бэклогам), поэтому
@@ -519,7 +531,7 @@ impl Engine {
                 );
                 let manager_ref = &self.manager;
                 self.factory
-                    .log_stats(&self.socket_set, &|handle| manager_ref.get_buf_info(handle));
+                    .log_stats(&self.socket_set, Self::current_time(), &|handle| manager_ref.get_buf_info(handle));
 
                 // Download pipeline health: how many sockets are backlogged, total
                 // queued frames, and cumulative dispatch outcomes. If pending_*
@@ -639,6 +651,7 @@ impl Engine {
                             None => break,
                             Some(f) => {
                                 if f.event == RawCastEvent::Close {
+                                    self.queue_unreachable_for_failed_udp(f.socket_id);
                                     self.on_download_close(f.socket_id, &mut local_cache, &inbound_map);
                                 } else if f.event == RawCastEvent::Data {
                                     self.route_download(
@@ -653,6 +666,22 @@ impl Engine {
                     }
                 }
             }
+        }
+    }
+
+    /// The tunnel closed UDP flow `socket_id`. If it never got a single reply it
+    /// failed to open, so answer the app with ICMP "port unreachable": it then
+    /// falls back at once (QUIC to TCP) instead of waiting out its own timeout.
+    fn queue_unreachable_for_failed_udp(&mut self, socket_id: u64) {
+        if let Some(packet) = self.manager.tracker.udp_unreachable_packet(socket_id) {
+            // Bounded: never let a burst of failed flows grow this without limit.
+            if self.extra_tun_out.len() < 64 {
+                self.extra_tun_out.push_back(packet);
+            }
+            netrunner_logger::info!(
+                socket_id,
+                "udp flow closed by the tunnel before any reply: answering ICMP port unreachable"
+            );
         }
     }
 

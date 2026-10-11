@@ -1102,7 +1102,8 @@ impl TunnelEngine {
             self.requeue_pending(pending).await;
 
             if let Err(e) = res {
-                error!("TunnelEngine critical failure: {}", e);
+                metrics::counter!("netrunner_leg_engine_failure_total").increment(1);
+                error!(leg_id = self.leg_id, "TunnelEngine critical failure: {}", e);
                 return Err(e);
             }
 
@@ -1203,7 +1204,13 @@ impl TunnelEngine {
         let write_timeout =
             muxer.adaptive_leg_write_timeout(leg_id, std::time::Duration::from_secs(20));
         let stuck = || -> AppError {
-            error!(stream_id, "🔥 Physical leg STUCK on write. Killing leg.");
+            error!(
+                stream_id,
+                leg_id,
+                write_timeout_ms = write_timeout.as_millis() as u64,
+                leg_rtt_ms = muxer.leg_rtt_ms(leg_id).unwrap_or(0),
+                "🔥 Physical leg STUCK on write. Killing leg."
+            );
             // Increment counter; the call site in run() emits the full event
             // with the correct leg_id since handle_outbound is a static fn.
             crate::net::diagnostics::DIAG_COUNTERS
