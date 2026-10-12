@@ -4223,7 +4223,10 @@ mod tests {
         for _ in 0..300 {
             measured = (0..want as u32)
                 .filter_map(|leg| server.leg_rtt_ms(leg))
-                .filter(|rtt| *rtt > 0)
+                // A leg that has not timed a PING still reads the 250 ms starting
+                // value; a loopback round trip under a millisecond reads 0, so
+                // "measured" means "no longer the starting value", not "> 0".
+                .filter(|rtt| *rtt != crate::net::INITIAL_RTT_MS)
                 .collect();
             if !measured.is_empty() {
                 break;

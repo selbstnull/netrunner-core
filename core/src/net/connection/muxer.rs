@@ -66,6 +66,7 @@ use crate::net::INITIAL_RTT_MS;
 use crate::net::{
     BACKLOG_REAPER_IDLE_TIMEOUT, BACKLOG_REAPER_INTERVAL, BACKLOG_STUCK_GRACE, BRIDGE_READ_CHUNK,
     DATAGRAM_LEG_ID, MAX_DATAGRAM_LEG_PAYLOAD, MAX_PENDING_UDP_STREAMS, MAX_TUNNEL_LEGS,
+    MIN_LEGS_FOR_UDP_CARRIER,
     PENDING_UDP_STREAM_MAX_BYTES, PENDING_UDP_TTL, STREAM_BACKLOG_MAX_BYTES,
 };
 use crate::nrxp::FrameType;
@@ -341,6 +342,25 @@ impl MuxLeg {
 
         base.max(queue_delay).max(drain_delay).min(3.0) + retrans_penalty
     }
+}
+
+/// Load (see [`MuxLeg::selection_load_factor`]) above which the UDP carrier leg is
+/// skipped for a datagram: the queue there has stood for several round trips.
+const UDP_CARRIER_GIVE_UP_LOAD: f64 = 3.0;
+
+/// The TCP leg reserved for UDP carried over TCP: the live leg with the highest
+/// `leg_id`, once there are at least [`MIN_LEGS_FOR_UDP_CARRIER`] of them. Client
+/// and node apply the same rule to the same ids, so each direction of the leg is
+/// free of bulk TCP without any extra signalling; a transient disagreement while a
+/// leg comes or goes only costs a datagram a less quiet leg.
+fn udp_carrier_id(legs: &[MuxLeg]) -> Option<u32> {
+    if legs.len() < MIN_LEGS_FOR_UDP_CARRIER {
+        return None;
+    }
+    legs.iter()
+        .map(|leg| leg.id)
+        .filter(|id| *id != DATAGRAM_LEG_ID)
+        .max()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1231,14 +1251,26 @@ impl Muxer {
     /// Picks a new leg using latency plus application/kernel queue state.
     /// `exclude` is best-effort: if it would remove the only live leg, that leg
     /// remains eligible.
-    fn pick_leg(&self, exclude: Option<u32>) -> Option<MuxLeg> {
+    ///
+    /// `avoid_carrier` keeps TCP streams off the leg reserved for UDP carried over
+    /// TCP (see [`udp_carrier_id`]); if that leg is all there is, it is used anyway.
+    fn pick_leg(&self, exclude: Option<u32>, avoid_carrier: bool) -> Option<MuxLeg> {
         let legs = self.active_legs_cache.load_full();
         if legs.is_empty() {
             return None;
         }
 
-        let mut eligible: Vec<&MuxLeg> =
-            legs.iter().filter(|leg| exclude != Some(leg.id)).collect();
+        let carrier = if avoid_carrier { udp_carrier_id(&legs) } else { None };
+        let mut eligible: Vec<&MuxLeg> = legs
+            .iter()
+            .filter(|leg| exclude != Some(leg.id) && carrier != Some(leg.id))
+            .collect();
+        if eligible.is_empty() {
+            eligible = legs
+                .iter()
+                .filter(|leg| carrier != Some(leg.id))
+                .collect();
+        }
         if eligible.is_empty() {
             eligible = legs.iter().collect();
         }
@@ -1287,9 +1319,29 @@ impl Muxer {
             }
         }
 
-        let leg = self.pick_leg(None)?;
+        let leg = self.pick_leg(None, true)?;
         self.stream_bindings.insert(stream_id, leg.id);
         Some(leg)
+    }
+
+    /// Leg for the control frame that opens a UDP stream: the UDP carrier leg, so
+    /// the stream's `Close` (which follows its binding) and its datagrams share a
+    /// leg that bulk TCP does not use. Falls back to the ordinary choice.
+    fn select_udp_control_leg(&self, stream_id: u32) -> Option<MuxLeg> {
+        if let Some(leg_id_ref) = self.stream_bindings.get(&stream_id) {
+            let leg_id = *leg_id_ref;
+            if let Some(leg) = self.legs.get(&leg_id) {
+                return Some(leg.clone());
+            }
+        }
+        let legs = self.active_legs_cache.load_full();
+        match udp_carrier_id(&legs).and_then(|id| legs.iter().find(|leg| leg.id == id)) {
+            Some(leg) => {
+                self.stream_bindings.insert(stream_id, leg.id);
+                Some(leg.clone())
+            }
+            None => self.select_leg(stream_id),
+        }
     }
 
     /// Chooses a leg for one UDP datagram: prefers the physical UDP-native
@@ -1337,6 +1389,24 @@ impl Muxer {
     /// reordering; after a quiet gap, or immediately when that leg builds a
     /// standing queue, the next datagram may move.
     fn select_udp_leg_over_tcp(&self, stream_id: u32) -> Option<MuxLeg> {
+        // The reserved carrier leg takes every datagram, so a QUIC flow that fell
+        // back to TCP waits behind other datagrams only, never behind bulk TCP and
+        // its retransmissions. Only a leg that has built a multi-RTT standing queue
+        // is given up on, and then the datagram moves to the least loaded leg.
+        {
+            let legs = self.active_legs_cache.load_full();
+            if let Some(leg) =
+                udp_carrier_id(&legs).and_then(|id| legs.iter().find(|leg| leg.id == id))
+            {
+                if leg.selection_load_factor() < UDP_CARRIER_GIVE_UP_LOAD {
+                    metrics::counter!("netrunner_udp_carrier_total", "result" => "carrier")
+                        .increment(1);
+                    return Some(leg.clone());
+                }
+                metrics::counter!("netrunner_udp_carrier_total", "result" => "overloaded")
+                    .increment(1);
+            }
+        }
         let now = process_uptime_ms().max(1);
         let gap_ms = (GLOBAL_MIN_RTT.load(Ordering::Relaxed) as u64 / 2).clamp(10, 100);
         let previous = self.udp_flowlets.get(&stream_id).map(|state| *state);
@@ -1364,7 +1434,7 @@ impl Muxer {
                 .get(&old.leg_id)
                 .and_then(|leg| (leg.selection_load_factor() >= 1.0).then_some(old.leg_id))
         });
-        let selected = self.pick_leg(exclude)?;
+        let selected = self.pick_leg(exclude, false)?;
         self.udp_flowlets.insert(
             stream_id,
             UdpFlowletState {
@@ -1653,7 +1723,17 @@ impl Muxer {
                 }
             }
         } else {
-            let leg = match self.select_leg(message.stream_id) {
+            let opens_udp_stream = matches!(
+                message.frame_type,
+                FrameType::UdpConnect
+                    | FrameType::SecureUdpConnect
+                    | FrameType::MeshOnionUdpConnect
+            );
+            let leg = match if opens_udp_stream {
+                self.select_udp_control_leg(message.stream_id)
+            } else {
+                self.select_leg(message.stream_id)
+            } {
                 Some(l) => l,
                 None => {
                     return Err(AppError::new(
@@ -3041,6 +3121,83 @@ mod scheduling_tests {
             DATAGRAM_LEG_ID,
             "кадр больше потолка не должен уходить на физическую UDP-ногу"
         );
+    }
+
+    fn muxer_with_legs(count: u32) -> Muxer {
+        let muxer = Muxer::new(true, "carrier-test".into());
+        for leg_id in 0..count {
+            let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+            let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+            muxer.add_leg(leg_id, control_tx, data_tx);
+            muxer.legs.get(&leg_id).unwrap().stats.rtt_ms.store(50, Ordering::Relaxed);
+        }
+        muxer.update_legs_cache();
+        muxer
+    }
+
+    /// With enough legs the highest id is kept for UDP carried over TCP: no new TCP
+    /// stream is placed on it, however many streams open.
+    #[tokio::test]
+    async fn tcp_streams_stay_off_the_udp_carrier_leg() {
+        let muxer = muxer_with_legs(4);
+        for stream_id in (1..400).step_by(2) {
+            let leg = muxer.select_leg(stream_id).unwrap();
+            assert_ne!(leg.id, 3, "stream {stream_id} landed on the UDP carrier");
+        }
+        let used: std::collections::HashSet<u32> =
+            (1..400).step_by(2).map(|id| muxer.select_leg(id).unwrap().id).collect();
+        assert_eq!(used.len(), 3, "bulk streams should still spread over the other legs");
+    }
+
+    /// Every datagram carried over TCP uses the carrier leg, and the frame that
+    /// opens a UDP stream binds the stream there so its `Close` follows.
+    #[tokio::test]
+    async fn udp_over_tcp_rides_the_carrier_leg_only() {
+        let muxer = muxer_with_legs(4);
+        for stream_id in 0..50 {
+            assert_eq!(muxer.select_udp_leg(stream_id, 1250).unwrap().id, 3);
+        }
+        assert_eq!(muxer.select_udp_control_leg(9).unwrap().id, 3);
+        assert_eq!(muxer.select_leg(9).unwrap().id, 3, "Close must follow the stream's leg");
+    }
+
+    /// Below the threshold nothing is reserved: two legs share everything, as before.
+    #[tokio::test]
+    async fn no_leg_is_reserved_when_there_are_too_few() {
+        let muxer = muxer_with_legs(2);
+        let used: std::collections::HashSet<u32> =
+            (1..100).step_by(2).map(|id| muxer.select_leg(id).unwrap().id).collect();
+        assert_eq!(used.len(), 2);
+        let udp: std::collections::HashSet<u32> = (0..100)
+            .map(|id| {
+                muxer.stream_bindings.clear();
+                muxer.select_udp_leg(id, 100).unwrap().id
+            })
+            .collect();
+        assert!(!udp.is_empty());
+    }
+
+    /// A carrier with a standing multi-RTT queue is given up on for datagrams.
+    #[tokio::test]
+    async fn an_overloaded_carrier_leg_is_skipped_for_datagrams() {
+        let muxer = muxer_with_legs(4);
+        let carrier = muxer.legs.get(&3).unwrap();
+        carrier.stats.tcp_delivery_rate.store(1_000, Ordering::Relaxed);
+        carrier.stats.tcp_notsent_bytes.store(1_000_000, Ordering::Relaxed);
+        drop(carrier);
+        let leg = muxer.select_udp_leg(5, 1250).unwrap();
+        assert_ne!(leg.id, 3, "a jammed carrier must not take new datagrams");
+    }
+
+    /// When the carrier dies the next highest id takes over.
+    #[tokio::test]
+    async fn the_carrier_moves_when_its_leg_goes_away() {
+        let muxer = muxer_with_legs(4);
+        assert_eq!(muxer.select_udp_leg(1, 100).unwrap().id, 3);
+        let control_tx = muxer.legs.get(&3).unwrap().control_tx.clone();
+        muxer.remove_leg(3, &control_tx);
+        // Three legs are left, still enough to reserve one: the highest carries.
+        assert_eq!(muxer.select_udp_leg(1, 100).unwrap().id, 2);
     }
 
     /// The remembered attempt roots: one entry per distinct root, newest first,

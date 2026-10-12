@@ -87,6 +87,8 @@ Every UDP datagram is counted where the leg is chosen (`select_udp_leg`):
   mesh-QUIC DATAGRAM leg) or `tcp` (carried inside the reliable legs / QUIC stream);
   `reason` is `ok`, `no_leg` (no native leg in the session), `stale` (no pong on the
   native leg for 45 s) or `oversize` (payload larger than the leg's ceiling).
+* `netrunner_udp_carrier_total{result}`: datagrams carried over TCP that used the reserved carrier leg (`carrier`)
+  or skipped it because its queue stood for several RTTs (`overloaded`).
 * `netrunner_udp_oversize_total{size}`: the same oversize datagrams by size class
   (`1201-1252`, `1253-1350`, `over-1350`), i.e. what the ceiling would have to be.
 * TCP legs, sampled every 250 ms per leg: `netrunner_leg_tcp_retrans_segments_total`,

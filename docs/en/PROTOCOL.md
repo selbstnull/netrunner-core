@@ -707,6 +707,11 @@ as `UdpData` — nothing else is required.
 * A `UdpData` frame > `MAX_DATAGRAM_LEG_PAYLOAD = 1290` B (fits the 1250/1252 B packets real QUIC stacks send; the RFC minimum is 1200) goes over TCP (no fragmentation); the outer
   UDP payload at the ceiling is 1352 B (1400 B with IPv6/UDP headers). Receiving is not limited by the ceiling: peers with the old 1150 ceiling accept
   such datagrams unchanged.
+* UDP carried over TCP (no native leg, a frame over the ceiling, or a stale leg) rides the **carrier leg**: with ≥ 3 live TCP legs
+  that is the leg with the highest `leg_id` (`MIN_LEGS_FOR_UDP_CARRIER = 3`). The `leg_id` is shared by client and node, so both
+  sides pick it by the same rule with no extra frame. New TCP streams avoid it, `UdpConnect` binds the UDP stream to it, so QUIC
+  on TCP queues behind other datagrams only, never behind bulk TCP and its retransmissions. A leg with a multi-RTT standing queue
+  (load >= 3) is skipped and the datagram goes to the least loaded leg. Metric `netrunner_udp_carrier_total{result}`.
 * An early `UdpData` may overtake its `UdpConnect` (which travels over TCP): the server buffers up to
   256 streams × 16 KiB × 2 s.
 
