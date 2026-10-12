@@ -4218,7 +4218,9 @@ mod tests {
             .map(|e| e.value().clone())
             .expect("the node has the session");
         let mut measured = Vec::new();
-        for _ in 0..120 {
+        // The keepalive timer is jittered and a loaded machine delays it further, so
+        // wait generously; the assertion below is about the value, not the speed.
+        for _ in 0..300 {
             measured = (0..want as u32)
                 .filter_map(|leg| server.leg_rtt_ms(leg))
                 .filter(|rtt| *rtt > 0)
