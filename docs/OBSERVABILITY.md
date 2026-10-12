@@ -89,6 +89,10 @@ Every UDP datagram is counted where the leg is chosen (`select_udp_leg`):
   native leg for 45 s) or `oversize` (payload larger than the leg's ceiling).
 * `netrunner_udp_oversize_total{size}`: the same oversize datagrams by size class
   (`1201-1252`, `1253-1350`, `over-1350`), i.e. what the ceiling would have to be.
+* TCP legs, sampled every 250 ms per leg: `netrunner_leg_tcp_retrans_segments_total`,
+  `netrunner_leg_tcp_loss_samples_total` / `netrunner_leg_tcp_samples_total` (the share of samples that
+  found a leg inside loss recovery) and the histogram `netrunner_leg_tcp_notsent_bytes` (kernel queue
+  in front of the wire).
 * `netrunner_mesh_datagram_ceiling_bytes`: current ceiling of the node-to-node leg.
 * Client side: `netrunner_datagram_leg_rebuilds_total{result=restored|failed}` and the warning
   `UDP leg is dead: building a new one` (fields `silent_ms`, `had_leg`, `previous_failures`)

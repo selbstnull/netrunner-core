@@ -1520,7 +1520,18 @@ impl Muxer {
             stats
                 .last_retrans_ms
                 .store(process_uptime_ms().max(1), Ordering::Relaxed);
+            // Without these the cost of TCP loss recovery on the legs is invisible
+            // until a leg dies: retransmitted segments, and how many 250 ms
+            // samples found a leg inside loss recovery (a leg in recovery stalls
+            // every stream bound to it, and any datagram carried over it).
+            metrics::counter!("netrunner_leg_tcp_retrans_segments_total")
+                .increment(u64::from(sample.total_retrans - previous));
+            metrics::counter!("netrunner_leg_tcp_loss_samples_total").increment(1);
         }
+        metrics::counter!("netrunner_leg_tcp_samples_total").increment(1);
+        // Bytes queued in the kernel behind the wire: what a datagram or the first
+        // chunk of a new stream waits for on this leg.
+        metrics::histogram!("netrunner_leg_tcp_notsent_bytes").record(sample.notsent_bytes as f64);
     }
 
     /// Отправляет кадр в сеть, выбирая ногу и применяя стратегию по типу кадра.
