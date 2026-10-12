@@ -2414,7 +2414,7 @@ dependencies = [
 [[package]]
 name = "nrxp-smoltcp"
 version = "0.13.0"
-source = "git+https://gitea.netrunner-vpn.com/nineap/nrxp-smoltcp.git?branch=main#e7be0fcc2ee1f115f4552a938007989d81c1783f"
+source = "git+https://gitea.netrunner-vpn.com/nineap/nrxp-smoltcp.git?branch=main#e76cf349737c3588f3f9be346e2f55ea652f8b28"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
