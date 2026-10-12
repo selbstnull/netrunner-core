@@ -1169,6 +1169,41 @@ mod mesh_quic_ceiling_tests {
 }
 
 #[cfg(test)]
+mod ceiling_size_tests {
+    use super::*;
+    use crate::dgram_leg::DgramEngineKind;
+
+    /// A `UdpData` payload of every size a real QUIC stack sends (1200 minimum,
+    /// 1250 as seen at the exits, 1252, and the ceiling itself) is sealed and opened by
+    /// each engine, and the outer UDP payload stays within payload + the 62 bytes of
+    /// framing the ceiling arithmetic assumes (21 engine + 25 frame header + 16 tag).
+    #[test]
+    fn every_engine_carries_the_ceiling_within_its_budget() {
+        let root = [0x5au8; 32];
+        for kind in [DgramEngineKind::Quic, DgramEngineKind::WebRtc] {
+            let (mut client_tx, _client_rx) = build_mimicry_pair(&kind, root, true);
+            let (_server_tx, mut server_rx) = build_mimicry_pair(&kind, root, false);
+            for size in [1200usize, 1250, 1252, crate::net::MAX_DATAGRAM_LEG_PAYLOAD] {
+                let payload = Bytes::from(vec![0xA5u8; size]);
+                let sealed = client_tx
+                    .seal(7, FrameType::UdpData, payload.clone())
+                    .unwrap_or_else(|e| panic!("{kind:?} cannot seal {size} bytes: {e:?}"));
+                assert!(
+                    sealed.len() <= size + crate::rawdgram::RAW_DGRAM_OVERHEAD,
+                    "{kind:?}: {size} B payload became {} B on the wire (budget {})",
+                    sealed.len(),
+                    size + crate::rawdgram::RAW_DGRAM_OVERHEAD
+                );
+                let opened = server_rx
+                    .open(&sealed)
+                    .unwrap_or_else(|e| panic!("{kind:?} cannot open {size} bytes: {e:?}"));
+                assert_eq!(opened.payload, payload, "{kind:?} corrupted a {size} B payload");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::net::connection::connection::SessionManager;

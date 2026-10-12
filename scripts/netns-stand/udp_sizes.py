@@ -5,7 +5,7 @@ import socket, sys, time
 
 host, port = sys.argv[1], int(sys.argv[2])
 per = int(sys.argv[3]) if len(sys.argv) > 3 else 20
-sizes = [int(x) for x in sys.argv[4].split(",")] if len(sys.argv) > 4 else [200, 1000, 1100, 1150, 1200, 1252, 1350]
+sizes = [int(x) for x in sys.argv[4].split(",")] if len(sys.argv) > 4 else [200, 1000, 1200, 1250, 1252, 1290, 1291, 1350]
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(0.5)
 s.connect((host, port))

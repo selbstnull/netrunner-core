@@ -699,8 +699,8 @@ as `UdpData` — nothing else is required.
   address is read on every send (roaming behind NAT).
 * Classifying an incoming datagram by its first byte: ranges QUIC short header / RTP (`128..191`,
   RFC 7983) / everything else (raw).
-* A `UdpData` frame > `MAX_DATAGRAM_LEG_PAYLOAD = 1200` B (the smallest QUIC datagram) goes over TCP (no fragmentation); the outer
-  UDP payload at the ceiling is 1262 B. Receiving is not limited by the ceiling: peers with the old 1150 ceiling accept
+* A `UdpData` frame > `MAX_DATAGRAM_LEG_PAYLOAD = 1290` B (fits the 1250/1252 B packets real QUIC stacks send; the RFC minimum is 1200) goes over TCP (no fragmentation); the outer
+  UDP payload at the ceiling is 1352 B (1400 B with IPv6/UDP headers). Receiving is not limited by the ceiling: peers with the old 1150 ceiling accept
   such datagrams unchanged.
 * An early `UdpData` may overtake its `UdpConnect` (which travels over TCP): the server buffers up to
   256 streams × 16 KiB × 2 s.
@@ -968,7 +968,7 @@ detail and an assessment — [SECURITY_MODEL.md](SECURITY_MODEL.md) §6):
 | `CREDIT_INITIAL_WINDOW` / `MIN` / `MAX` / `GLOBAL_BUDGET` | 1 MiB / 256 KiB / 16 MiB / 64 MiB | `net/credit.rs` |
 | `CREDIT_STALL_FALLBACK` | 600 s | `net/constants.rs` |
 | `DATAGRAM_LEG_HANDSHAKE_TIMEOUT` | 3 s | `net/constants.rs` |
-| `MAX_DATAGRAM_LEG_PAYLOAD` | 1200 B | `net/constants.rs` |
+| `MAX_DATAGRAM_LEG_PAYLOAD` | 1290 B | `net/constants.rs` |
 | `DATAGRAM_KEEPALIVE_MIN` / `MAX` | 15 / 25 s | `net/constants.rs` |
 | `REKEY_AFTER_DATAGRAMS` / `STREAM_REKEY_AFTER_RECORDS` | 2²⁰ / 2²⁰ (AES-GCM) | `nrxp/datagram.rs`, `crypto/chacha.rs` |
 | datagram anti-replay window | 2048 | `nrxp/datagram.rs` |
