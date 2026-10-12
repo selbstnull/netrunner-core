@@ -104,6 +104,9 @@ pub enum DialKind {
     Timeout,
     Resolve,
     Bind,
+    /// The destination is an address no public exit can legitimately reach
+    /// (carrier-grade NAT or benchmarking space), so it was not dialed.
+    Blocked,
     Other,
 }
 
@@ -116,6 +119,7 @@ impl DialKind {
             DialKind::Timeout => "timeout",
             DialKind::Resolve => "resolve",
             DialKind::Bind => "bind",
+            DialKind::Blocked => "blocked",
             DialKind::Other => "other",
         }
     }

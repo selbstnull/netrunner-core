@@ -77,20 +77,30 @@ impl TargetResolver {
 
     /// Восстанавливает реальную цель `(ip, "host:port")` по адресу из пакета.
     /// Для фейкового IPv4 поднимает домен из [`FakeIpStore`]; иначе использует сам IP.
-    pub fn resolve_destination(&self, addr: IpAddress, port: u16) -> (std::net::Ipv4Addr, String) {
+    ///
+    /// `None` — адрес из фейкового диапазона, для которого домена уже нет. Такой
+    /// адрес нельзя отправлять ноде как есть: он нигде не маршрутизируется, и выход
+    /// ждал бы таймаут на каждом узле цепочки (21 с и ни одного байта). Лучше
+    /// сразу оборвать соединение, чтобы приложение переспросило DNS.
+    pub fn resolve_destination(
+        &mut self,
+        addr: IpAddress,
+        port: u16,
+    ) -> Option<(std::net::Ipv4Addr, String)> {
         match addr {
             IpAddress::Ipv4(ip) => {
-                let std_ip = ip;
-                if let Some(domain) = self.fake_ip_store.lookup_by_ip(&std_ip) {
-                    (std_ip, format!("{}:{}", domain, port))
+                if let Some(domain) = self.fake_ip_store.lookup_by_ip(&ip) {
+                    Some((ip, format!("{}:{}", domain, port)))
+                } else if crate::net::dns::is_fake_ip(ip) {
+                    None
                 } else {
-                    (std_ip, format!("{}:{}", std_ip, port))
+                    Some((ip, format!("{}:{}", ip, port)))
                 }
             }
-            IpAddress::Ipv6(ip) => (
+            IpAddress::Ipv6(ip) => Some((
                 std::net::Ipv4Addr::UNSPECIFIED,
                 format!("[{}]:{}", ip, port),
-            ),
+            )),
         }
     }
 }
@@ -290,8 +300,11 @@ impl ConnectionManager {
             return;
         }
 
+        let Some((dst_ip, target)) = self.resolver.resolve_destination(f.dst, f.dst_p) else {
+            warn!("UDP to a fake IP that lost its domain: not tunneled, the app will re-resolve");
+            return;
+        };
         let socket_id = self.tracker.next_id();
-        let (dst_ip, target) = self.resolver.resolve_destination(f.dst, f.dst_p);
         let socket = self.factory.create_bound_udp(Some(f.dst), f.dst_p);
 
         if socket.is_open() {
@@ -354,13 +367,23 @@ impl ConnectionManager {
             let key = (remote.addr, remote.port, local.addr, local.port);
             self.pending_connects.remove(&key);
 
+            let Some((dst_ip, target)) = self.resolver.resolve_destination(local.addr, local.port)
+            else {
+                // The app dialed a fake IP whose domain was forgotten. Reset the
+                // connection at once so it re-resolves, instead of tunnelling a
+                // dead address and waiting out a 21 s multi-exit timeout.
+                warn!("TCP to a fake IP that lost its domain: reset, the app will re-resolve");
+                socket.abort();
+                self.tracker.queue_removal(handle);
+                return;
+            };
+
             let permit = self
                 .tracker
                 .pop_pending_permit(handle)
                 .expect("Permit must exist for pending TCP connection");
 
             let socket_id = self.tracker.next_id();
-            let (dst_ip, target) = self.resolver.resolve_destination(local.addr, local.port);
 
             let (conn, rx_smol, tx_smol, handshake_tx, is_saturated) = TcpConnection::new(
                 handle,
@@ -441,5 +464,52 @@ impl ConnectionManager {
 
     pub fn get_buf_info(&self, handle: SocketHandle) -> usize {
         self.tracker.get_app_buffer_info(handle)
+    }
+}
+
+
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+    use smoltcp::wire::Ipv4Address;
+
+    fn resolver() -> TargetResolver {
+        TargetResolver::new(DnsHandler::new(".", Vec::new()))
+    }
+
+    #[test]
+    fn a_known_fake_ip_resolves_to_its_domain() {
+        let mut r = resolver();
+        let ip = r.fake_ip_store.get_or_assign("example.org");
+        let (_, target) = r
+            .resolve_destination(IpAddress::Ipv4(ip), 443)
+            .expect("mapped");
+        assert_eq!(target, "example.org:443");
+    }
+
+    /// A fake IP whose domain was forgotten must not be tunnelled as a literal: no
+    /// exit can reach it, and each would sit out its dial timeout.
+    #[test]
+    fn an_unmapped_fake_ip_is_not_tunnelled() {
+        let mut r = resolver();
+        let orphan = Ipv4Address::new(100, 64, 77, 77);
+        assert!(r.resolve_destination(IpAddress::Ipv4(orphan), 443).is_none());
+    }
+
+    #[test]
+    fn real_addresses_pass_through_as_literals() {
+        let mut r = resolver();
+        let (ip, target) = r
+            .resolve_destination(IpAddress::Ipv4(Ipv4Address::new(93, 184, 216, 34)), 443)
+            .expect("literal");
+        assert_eq!(ip, std::net::Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(target, "93.184.216.34:443");
+        let (_, v6) = r
+            .resolve_destination(
+                IpAddress::Ipv6(smoltcp::wire::Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                443,
+            )
+            .expect("v6");
+        assert_eq!(v6, "[2001:db8::1]:443");
     }
 }

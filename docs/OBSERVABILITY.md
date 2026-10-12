@@ -20,10 +20,10 @@ Emitted exactly once when a stream a client opened through this node goes away.
 | `family` | `v4` / `v6` / `name` (host name: family unknown until the exit resolves it) |
 | `route` | `local` (dialed here), `onion` (sent to another node), `failover` (local dial failed, backup exit used), `reverse`, `relay` (this node is a hop/exit for another node's flow) |
 | `outcome` | `closed` (normal) or the reason: `dial_failed`, `egress_exhausted`, `no_egress_candidate`, `route_setup_deadline`, `route_rejected`, `rejected*`, `refused_*`, `cancelled` |
-| `dial` | last dial failure kind: `net_unreachable`, `host_unreachable`, `refused`, `timeout`, `resolve`, `bind`, `other`, or `-` |
+| `dial` | last dial failure kind: `net_unreachable`, `host_unreachable`, `refused`, `timeout`, `resolve`, `bind`, `blocked` (CGNAT/benchmark space, never dialed), `other`, or `-` |
 | `attempts` | exit attempts (primary + failovers) |
 | `duration_ms`, `first_byte_ms` | lifetime; time to the first byte sent back (`-1` = none) |
-| `up_bytes`, `down_bytes` | client→destination / destination→client |
+| `up_bytes`, `down_bytes` | client→destination / destination→client (TCP and UDP datagrams) |
 | `credit_stall_ms`, `credit_stalls` | time the sender sat blocked on the client's flow-control window |
 
 Reading it: a video that "hangs" shows up as a long `duration_ms` with a large
@@ -68,3 +68,12 @@ count as capable so a mixed fleet keeps working.
 
 On the client, a UDP flow the tunnel closes before any reply is answered with
 ICMP(v6) "port unreachable" so a QUIC app falls back immediately.
+
+## Fake IPs and "literal" targets
+
+The client answers DNS with fake addresses from `100.64.0.0/10` and keeps the
+name behind each one. A flow whose target shows up at an exit as a literal IPv4
+(`family="v4"`) that every exit then fails to dial (`dial="timeout"`,
+`outcome="egress_exhausted"`, ~7 s per exit) is the signature of a fake IP that lost
+its name. The client now resets such a connection at once and the exit refuses
+`100.64.0.0/10` and `198.18.0.0/15` outright (`dial="blocked"`).

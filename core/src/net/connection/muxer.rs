@@ -210,6 +210,9 @@ struct CreditState {
     created_ms: u64,
     /// Wall-clock ms of the first Data byte sent down this stream (0 = none yet).
     first_down_ms: AtomicU64,
+    /// Datagram bytes sent down this stream. `sent` only counts credit-gated
+    /// `Data`, so without this a UDP flow always reported 0 bytes back.
+    udp_down_bytes: AtomicU64,
     /// Total ms the sender sat blocked on the window, and how many separate stalls.
     stall_ms: AtomicU64,
     stalls: AtomicU32,
@@ -228,6 +231,7 @@ impl CreditState {
             closed: AtomicBool::new(false),
             created_ms: now,
             first_down_ms: AtomicU64::new(0),
+            udp_down_bytes: AtomicU64::new(0),
             stall_ms: AtomicU64::new(0),
             stalls: AtomicU32::new(0),
             last_probe_ms: AtomicU64::new(0),
@@ -1328,6 +1332,9 @@ impl Muxer {
     #[instrument(skip(self, message), fields(session_id = %self.session_id, stream_id = message.stream_id, frame = ?message.frame_type))]
     pub async fn send_to_network(&self, message: MuxMessage) -> Result<(), AppError> {
         let is_data = matches!(message.frame_type, FrameType::Data | FrameType::UdpData);
+        if message.frame_type == FrameType::UdpData {
+            self.note_udp_down(message.stream_id, message.data.len());
+        }
 
         // End-to-end flow control: if the receiver of this stream grants credit, don't
         // outrun it. Datagrams are exempt (UDP is best-effort and drops when late).
@@ -1603,6 +1610,21 @@ impl Muxer {
     }
 
     /// Списывает отправленные `size` байт Data с кредитного окна потока.
+    /// Counts a datagram sent down `stream_id` for the closing trace line.
+    fn note_udp_down(&self, stream_id: u32, size: usize) {
+        if let Some(state) = self.credits.get(&stream_id) {
+            state.udp_down_bytes.fetch_add(size as u64, Ordering::Relaxed);
+            if state.first_down_ms.load(Ordering::Relaxed) == 0 {
+                let _ = state.first_down_ms.compare_exchange(
+                    0,
+                    diagnostics::current_timestamp_ms().max(1),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
     fn debit_credit(&self, stream_id: u32, size: usize) {
         if let Some(state) = self.credits.get(&stream_id) {
             state.sent.fetch_add(size as u64, Ordering::AcqRel);
@@ -1889,7 +1911,8 @@ impl Muxer {
         }
         let totals = StreamTotals {
             up_bytes: entry.stats.rx_bytes.load(Ordering::Relaxed),
-            down_bytes: entry.credit.sent.load(Ordering::Relaxed),
+            down_bytes: entry.credit.sent.load(Ordering::Relaxed)
+                + entry.credit.udp_down_bytes.load(Ordering::Relaxed),
             credit_stall_ms: entry.credit.stall_ms.load(Ordering::Relaxed),
             credit_stalls: entry.credit.stalls.load(Ordering::Relaxed),
         };

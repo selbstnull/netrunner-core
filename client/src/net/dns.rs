@@ -45,8 +45,19 @@ const PUBLIC_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Start of the RFC 6598 (CGNAT) range used for fake DNS responses.
 const FAKE_IP_START: u32 = 0x6440_0001; // 100.64.0.1
-/// LRU capacity for the domain→IP and IP→domain mapping tables.
-const FAKE_IP_CACHE_SIZE: usize = 2000;
+/// LRU capacity for the domain→IP and IP→domain mapping tables. An app keeps
+/// using an address long after its 60 s DNS answer expired (pooled connections,
+/// its own DNS cache), so a mapping must outlive many other lookups; 2000 was
+/// small enough for a busy phone to push a still-used entry out.
+const FAKE_IP_CACHE_SIZE: usize = 16_384;
+/// The fake range handed out above: `100.64.0.0/10` (RFC 6598).
+const FAKE_IP_PREFIX: u32 = 0x6440_0000;
+const FAKE_IP_MASK: u32 = 0xffc0_0000;
+
+/// Whether `ip` lies in the range fake DNS answers come from.
+pub fn is_fake_ip(ip: Ipv4Addr) -> bool {
+    u32::from(ip) & FAKE_IP_MASK == FAKE_IP_PREFIX
+}
 /// Re-download the blocklist if the cached file is older than this.
 const BLOCKLIST_UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Delay before starting a background blocklist download on first run.
@@ -82,10 +93,19 @@ impl FakeIpStore {
     pub fn get_or_assign(&mut self, host: &str) -> Ipv4Addr {
         if let Some(&ip) = self.cache.get(host) {
             debug!(host = %host, ip = %ip, "Cache hit: IP already assigned");
+            // Keep the reverse entry as fresh as the forward one: the two LRUs used
+            // to age separately, so a domain asked about all the time could lose its
+            // IP→domain entry and the app's next connect went out as a bare fake IP.
+            self.rev_cache.promote(&ip);
             return ip;
         }
         let ip = Ipv4Addr::from(self.next_ip);
         self.next_ip += 1;
+        if !is_fake_ip(Ipv4Addr::from(self.next_ip)) {
+            // The range is exhausted (millions of lookups on one session): start
+            // over rather than hand out real public addresses as "fake" ones.
+            self.next_ip = FAKE_IP_START;
+        }
 
         self.cache.put(host.to_string(), ip);
         self.rev_cache.put(ip, host.to_string());
@@ -94,10 +114,13 @@ impl FakeIpStore {
         ip
     }
 
-    pub fn lookup_by_ip(&self, ip: &Ipv4Addr) -> Option<String> {
-        if let Some(host) = self.rev_cache.peek(ip) {
+    /// Resolves a fake IP back to its domain and marks the pair as in use, so a
+    /// connection the app keeps opening to the same address never loses it.
+    pub fn lookup_by_ip(&mut self, ip: &Ipv4Addr) -> Option<String> {
+        if let Some(host) = self.rev_cache.get(ip).cloned() {
+            self.cache.promote(&host);
             debug!(ip = %ip, host = %host, "Reverse lookup successful");
-            Some(host.clone())
+            Some(host)
         } else {
             debug!(ip = %ip, "Reverse lookup miss");
             None
@@ -413,4 +436,60 @@ pub async fn resolve_via_public_dns(domain: &str) -> Option<Ipv4Addr> {
         );
     }
     ip
+}
+
+
+#[cfg(test)]
+mod fake_ip_tests {
+    use super::*;
+
+    /// A domain the app keeps using must keep its address mapping however many other
+    /// domains are resolved meanwhile. The reverse table used to age on its own, so
+    /// the entry vanished and the next connect went out as a bare fake IP.
+    #[test]
+    fn an_address_that_is_still_in_use_keeps_its_domain() {
+        let mut store = FakeIpStore::new();
+        let hot = store.get_or_assign("hot.example");
+        for i in 0..(FAKE_IP_CACHE_SIZE + 500) {
+            store.get_or_assign(&format!("other-{i}.example"));
+            if i % 100 == 0 {
+                // the app keeps connecting to the address it was given
+                assert_eq!(store.lookup_by_ip(&hot).as_deref(), Some("hot.example"));
+            }
+        }
+        assert_eq!(store.lookup_by_ip(&hot).as_deref(), Some("hot.example"));
+    }
+
+    /// Asking DNS again for a hot name also keeps its reverse entry alive.
+    #[test]
+    fn repeated_dns_answers_keep_the_reverse_entry() {
+        let mut store = FakeIpStore::new();
+        let ip = store.get_or_assign("repeat.example");
+        for i in 0..(FAKE_IP_CACHE_SIZE + 500) {
+            store.get_or_assign(&format!("filler-{i}.example"));
+            if i % 100 == 0 {
+                assert_eq!(store.get_or_assign("repeat.example"), ip);
+            }
+        }
+        assert_eq!(store.lookup_by_ip(&ip).as_deref(), Some("repeat.example"));
+    }
+
+    #[test]
+    fn the_fake_range_is_the_cgnat_block() {
+        assert!(is_fake_ip(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_fake_ip(Ipv4Addr::new(100, 127, 255, 254)));
+        assert!(!is_fake_ip(Ipv4Addr::new(100, 63, 255, 255)));
+        assert!(!is_fake_ip(Ipv4Addr::new(100, 128, 0, 1)));
+        assert!(!is_fake_ip(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn allocation_never_leaves_the_fake_range() {
+        let mut store = FakeIpStore::new();
+        store.next_ip = 0x647f_ffff; // 100.127.255.255, the last address of the block
+        let last = store.get_or_assign("last.example");
+        let wrapped = store.get_or_assign("wrapped.example");
+        assert!(is_fake_ip(last) && is_fake_ip(wrapped));
+        assert_eq!(wrapped, Ipv4Addr::from(FAKE_IP_START));
+    }
 }

@@ -58,17 +58,42 @@ fn family_of(addr: &SocketAddr) -> Family {
     }
 }
 
+/// Space that no public exit can reach and that a client only ever sends by
+/// mistake: carrier-grade NAT `100.64.0.0/10` (the client hands apps fake IPs
+/// from here and keeps the name; one that lost its name used to be dialed
+/// literally, and every exit then sat out its 7 s timeout) and the benchmarking
+/// range `198.18.0.0/15`. Refusing them answers in milliseconds instead of
+/// after `3 x 7 s`.
+pub(crate) fn is_unreachable_special(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            let o = ip.octets();
+            (o[0] == 100 && (o[1] & 0xc0) == 64) || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
 /// Resolves `target` (`"host:port"`, `"ip:port"` or `"[v6]:port"`) to an
-/// IPv4-first ordered list.
+/// IPv4-first ordered list, without addresses no exit can reach.
 pub(crate) async fn resolve(target: &str) -> Result<Vec<SocketAddr>, DialKind> {
     match timeout(RESOLVE_TIMEOUT, lookup_host(target)).await {
         Ok(Ok(addrs)) => {
-            let ordered = interleave(addrs.collect());
-            if ordered.is_empty() {
-                Err(DialKind::Resolve)
-            } else {
-                Ok(ordered)
+            let all: Vec<SocketAddr> = addrs.collect();
+            let reachable: Vec<SocketAddr> = all
+                .iter()
+                .copied()
+                .filter(|addr| !is_unreachable_special(addr))
+                .collect();
+            if reachable.is_empty() {
+                // Nothing resolved at all, or everything was unreachable space.
+                return Err(if all.is_empty() {
+                    DialKind::Resolve
+                } else {
+                    DialKind::Blocked
+                });
             }
+            Ok(interleave(reachable))
         }
         Ok(Err(_)) => Err(DialKind::Resolve),
         Err(_) => Err(DialKind::Timeout),
@@ -193,6 +218,31 @@ mod tests {
         );
         assert!(interleave(vec![]).is_empty());
         assert_eq!(interleave(vec![a("[::1]:1")]), vec![a("[::1]:1")]);
+    }
+
+    #[test]
+    fn carrier_grade_nat_and_benchmark_space_are_never_dialed() {
+        assert!(is_unreachable_special(&a("100.64.0.1:443")));
+        assert!(is_unreachable_special(&a("100.127.255.254:443")));
+        assert!(is_unreachable_special(&a("198.18.0.9:443")));
+        assert!(is_unreachable_special(&a("198.19.255.1:443")));
+        assert!(!is_unreachable_special(&a("100.63.255.255:443")));
+        assert!(!is_unreachable_special(&a("100.128.0.1:443")));
+        assert!(!is_unreachable_special(&a("198.17.0.1:443")));
+        assert!(!is_unreachable_special(&a("198.20.0.1:443")));
+        assert!(!is_unreachable_special(&a("93.184.216.34:443")));
+        assert!(!is_unreachable_special(&a("[2001:db8::1]:443")));
+    }
+
+    /// The fake-IP leak: the exit must answer at once, not after three timeouts.
+    #[tokio::test]
+    async fn a_leaked_fake_ip_is_refused_immediately() {
+        let started = Instant::now();
+        let error = connect_tcp("100.64.3.7:443", Duration::from_secs(7)).await.err().unwrap();
+        assert_eq!(error, DialKind::Blocked);
+        let error = connect_udp("100.64.3.7:443").await.err().unwrap();
+        assert_eq!(error, DialKind::Blocked);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
