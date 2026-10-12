@@ -90,6 +90,9 @@ Every UDP datagram is counted where the leg is chosen (`select_udp_leg`):
 * `netrunner_udp_oversize_total{size}`: the same oversize datagrams by size class
   (`1201-1252`, `1253-1350`, `over-1350`), i.e. what the ceiling would have to be.
 * `netrunner_mesh_datagram_ceiling_bytes`: current ceiling of the node-to-node leg.
+* Client side: `netrunner_datagram_leg_rebuilds_total{result=restored|failed}` and the warning
+  `UDP leg is dead: building a new one` (fields `silent_ms`, `had_leg`, `previous_failures`)
+  show the supervisor rebuilding a UDP leg whose node went silent (e.g. restarted).
 
 A node-to-node QUIC connection starts at ~1160 bytes per DATAGRAM and grows to
 ~1410 once its path MTU has been probed; the leg's ceiling used to be read once at

@@ -8,8 +8,11 @@
 //! - **Клиент** ([`attempt_client_datagram_leg`]) — один `connect()`-нутый
 //!   сокет на единственного известного пира. Пробует ровно ОДИН движок
 //!   мимикрии (см. [`crate::dgram_leg::choose_engine`]), при неудаче —
-//!   голый UDP; при неудаче и этого — остаётся на TCP. Одна попытка на
-//!   жизнь сессии, без агрессивных ретраев (см. `docs/UDP_LEG_RESEARCH.md` §1).
+//!   голый UDP; при неудаче и этого — остаётся на TCP. Первая попытка одна, без
+//!   агрессивных ретраев (см. `docs/UDP_LEG_RESEARCH.md` §1); дальше ногу ведёт
+//!   супервизор ([`spawn_datagram_supervisor`]): молчащую или пропавшую ногу он
+//!   строит заново с нарастающей паузой (5 с, 15 с, 45 с, 135 с, 300 с), по самым
+//!   свежим корням ключей, которые нода регистрирует на каждом TCP-подключении.
 //! - **Сервер** ([`run_datagram_listener`]) — один общий сокет на ВСЕ
 //!   сессии процесса; классифицирует входящую датаграмму по первому байту
 //!   (диапазоны QUIC short header / RTP-подобных / всё остальное — см.
@@ -35,10 +38,8 @@
 //! `Muxer::selection_load_factor` — у UDP-ноги альтернатив для сравнения
 //! нет, вопрос только "жива или нет").
 
-use std::{net::SocketAddr, sync::Arc};
-
-#[cfg(feature = "mesh-quic")]
 use std::time::Duration;
+use std::{net::SocketAddr, sync::Arc};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -618,6 +619,17 @@ pub(crate) async fn attempt_client_datagram_leg(
     if muxer.is_fatal() {
         return;
     }
+    // Remember how to build this leg again, and make sure the session has a
+    // supervisor that does so when the leg dies (node restart, silent path).
+    muxer.note_datagram_attempt(crate::net::connection::muxer::DatagramAttempt::new(
+        udp_addr,
+        decoy_sni.clone(),
+        session_id.clone(),
+        datagram_root,
+    ));
+    if muxer.claim_datagram_supervisor() {
+        spawn_datagram_supervisor(muxer.clone(), SupervisorTiming::default());
+    }
     let bind_addr: SocketAddr = if udp_addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -705,9 +717,10 @@ pub(crate) async fn attempt_client_datagram_leg(
     // Клиент никогда сам не открывает соединения к целям — `opener: None`,
     // тот же контракт, что и у `StreamHandler` TCP-ног клиента.
     let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
-    // Тот же токен, что и у TCP-ног: смена сети должна убивать и UDP-ногу
-    // тоже (старый сокет на старом интерфейсе не отдаст ошибку сам по себе).
-    let token = muxer.network_epoch_token();
+    // Дочерний токен эпохи сети: смена сети по-прежнему убивает и UDP-ногу (старый
+    // сокет на старом интерфейсе не отдаст ошибку сам по себе), а замена ноги
+    // останавливает задачи прежней, не трогая новую.
+    let token = muxer.begin_datagram_leg_tasks();
 
     tokio::spawn(run_datagram_writer(
         tx,
@@ -719,6 +732,176 @@ pub(crate) async fn attempt_client_datagram_leg(
     tokio::spawn(run_client_datagram_reader(
         rx, socket, muxer, handler, control_tx, token,
     ));
+}
+
+// ============================================================================
+// Самовосстановление клиентской UDP-ноги
+// ============================================================================
+
+/// Timings of the UDP-leg supervisor. The defaults keep the recovery of a leg
+/// whose node restarted to ~20 s of silence plus one attempt.
+#[derive(Clone, Debug)]
+pub(crate) struct SupervisorTiming {
+    /// How often the leg is looked at.
+    pub(crate) tick: Duration,
+    /// Silence after which a liveness PING is queued (every tick while it lasts).
+    pub(crate) probe_after: Duration,
+    /// Silence (despite the probes) after which the leg is declared dead.
+    pub(crate) dead_after: Duration,
+    /// How long a missing leg is left alone before the first attempt to build it.
+    pub(crate) absent_grace: Duration,
+    /// Pauses after consecutive failed attempts; the last one repeats.
+    pub(crate) backoff: Vec<Duration>,
+}
+
+impl Default for SupervisorTiming {
+    fn default() -> Self {
+        Self {
+            tick: Duration::from_secs(3),
+            probe_after: Duration::from_secs(8),
+            dead_after: Duration::from_secs(20),
+            absent_grace: Duration::from_secs(10),
+            backoff: [5, 15, 45, 135, 300].map(Duration::from_secs).to_vec(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisorAction {
+    Nothing,
+    /// Queue a liveness PING on the leg.
+    Probe,
+    /// Tear the leg down (if any) and build a new one.
+    Reattempt,
+}
+
+/// What to do with the UDP leg given what is known about it right now.
+///
+/// A healthy leg hears from the node at least every keepalive interval (15-25 s),
+/// and the supervisor adds probes once it has been quiet for `probe_after`, so a
+/// leg that stays silent through them is dead: the node restarted and forgot the
+/// keys, the path is black-holed, or the socket is gone.
+pub(crate) fn supervisor_action(
+    leg_present: bool,
+    silence: Duration,
+    absent_for: Duration,
+    timing: &SupervisorTiming,
+) -> SupervisorAction {
+    if leg_present {
+        if silence >= timing.dead_after {
+            SupervisorAction::Reattempt
+        } else if silence >= timing.probe_after {
+            SupervisorAction::Probe
+        } else {
+            SupervisorAction::Nothing
+        }
+    } else if absent_for >= timing.absent_grace {
+        SupervisorAction::Reattempt
+    } else {
+        SupervisorAction::Nothing
+    }
+}
+
+/// Keeps the client's UDP leg alive for the whole session. Before this, the leg
+/// was tried once per network epoch: when the node restarted (or a first attempt
+/// failed) the client kept sending on a leg the node no longer knew, then fell
+/// back to the TCP legs for good, until the network changed.
+pub(crate) fn spawn_datagram_supervisor(muxer: Arc<Muxer>, timing: SupervisorTiming) {
+    tokio::spawn(async move {
+        let changed = muxer.datagram_attempts_changed();
+        let mut absent_since: Option<tokio::time::Instant> = None;
+        let mut failures = 0usize;
+        let mut next_allowed = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(timing.tick) => {}
+                _ = changed.notified() => {
+                    // A root the node has just registered: try it without the pause.
+                    failures = 0;
+                    next_allowed = tokio::time::Instant::now();
+                }
+            }
+            if muxer.is_fatal() {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            let silence = muxer.datagram_leg_silence();
+            match silence {
+                Some(_) => absent_since = None,
+                None => {
+                    absent_since.get_or_insert(now);
+                }
+            }
+            let absent_for = absent_since.map_or(Duration::ZERO, |since| now - since);
+            let action = supervisor_action(
+                silence.is_some(),
+                silence.unwrap_or(Duration::ZERO),
+                absent_for,
+                &timing,
+            );
+            match action {
+                SupervisorAction::Nothing => {
+                    if silence.is_some_and(|quiet| quiet < timing.probe_after) {
+                        failures = 0;
+                    }
+                }
+                SupervisorAction::Probe => {
+                    muxer.ping_datagram_leg();
+                }
+                SupervisorAction::Reattempt => {
+                    if now < next_allowed {
+                        continue;
+                    }
+                    let candidates = muxer.datagram_attempt_candidates();
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    // Newest root first; after failures walk through the older ones.
+                    let pick = candidates[failures % candidates.len()].clone();
+                    warn!(
+                        target: "netrunner_tunnel",
+                        silent_ms = silence.map_or(-1, |quiet| quiet.as_millis() as i64),
+                        had_leg = silence.is_some(),
+                        previous_failures = failures,
+                        "UDP leg is dead: building a new one"
+                    );
+                    muxer.cancel_datagram_leg_tasks();
+                    muxer.clear_datagram_leg();
+                    muxer.reset_datagram_leg_claim();
+                    if muxer.try_claim_datagram_leg_token(pick.token()) {
+                        attempt_client_datagram_leg(
+                            muxer.clone(),
+                            pick.addr,
+                            pick.decoy_sni.clone(),
+                            pick.session_id.clone(),
+                            pick.root,
+                        )
+                        .await;
+                    }
+                    let restored = muxer.datagram_leg_stats().is_some();
+                    metrics::counter!(
+                        "netrunner_datagram_leg_rebuilds_total",
+                        "result" => if restored { "restored" } else { "failed" }
+                    )
+                    .increment(1);
+                    let after = tokio::time::Instant::now();
+                    if restored {
+                        failures = 0;
+                        absent_since = None;
+                        next_allowed = after;
+                    } else {
+                        let pause = timing
+                            .backoff
+                            .get(failures.min(timing.backoff.len().saturating_sub(1)))
+                            .copied()
+                            .unwrap_or(Duration::from_secs(300));
+                        failures += 1;
+                        next_allowed = after + pause;
+                    }
+                }
+            }
+        }
+    });
 }
 
 async fn run_client_datagram_reader(
@@ -755,7 +938,9 @@ async fn run_client_datagram_reader(
             }
         }
     }
-    muxer.clear_datagram_leg();
+    // Only if the leg is still this one: after a replacement the old reader ends
+    // late and must not take the new leg down with it.
+    muxer.clear_datagram_leg_if(&control_tx);
 }
 
 // ============================================================================
@@ -1372,6 +1557,126 @@ mod tests {
         assert_eq!(&received[..], b"hello over the real udp leg");
 
         token.cancel();
+    }
+
+    fn fast_timing() -> SupervisorTiming {
+        SupervisorTiming {
+            tick: Duration::from_millis(50),
+            probe_after: Duration::from_millis(250),
+            dead_after: Duration::from_millis(700),
+            absent_grace: Duration::from_millis(300),
+            backoff: vec![Duration::from_millis(200)],
+        }
+    }
+
+    /// The decision table of the supervisor, in the production timings.
+    #[test]
+    fn the_supervisor_probes_then_rebuilds_a_silent_leg() {
+        let t = SupervisorTiming::default();
+        let s = Duration::from_secs;
+        use SupervisorAction::*;
+        // A leg that is being heard from is left alone.
+        assert_eq!(supervisor_action(true, s(0), s(0), &t), Nothing);
+        assert_eq!(supervisor_action(true, s(7), s(0), &t), Nothing);
+        // Quiet: probe; still quiet through the probes: rebuild.
+        assert_eq!(supervisor_action(true, s(8), s(0), &t), Probe);
+        assert_eq!(supervisor_action(true, s(19), s(0), &t), Probe);
+        assert_eq!(supervisor_action(true, s(20), s(0), &t), Reattempt);
+        // No leg: give an attempt in flight / a TCP reconnect some time, then build.
+        assert_eq!(supervisor_action(false, s(0), s(9), &t), Nothing);
+        assert_eq!(supervisor_action(false, s(0), s(10), &t), Reattempt);
+    }
+
+    /// The node restarts and forgets every key; the TCP legs reconnect and the client
+    /// learns the new root. Without the supervisor the client kept sending on the old
+    /// leg (which the node silently ignores) and never built another one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_supervisor_rebuilds_the_leg_after_the_node_forgets_it() {
+        crate::net::NetworkConfig::init_global(1500);
+        let (root_old, root_new) = ([0x11u8; 32], [0x22u8; 32]);
+
+        // Node, first life.
+        let sm1 = Arc::new(SessionManager::new());
+        let node1 = Arc::new(Muxer::new(false, "node-1".into()));
+        sm1.register_datagram_session(&node1, 0, root_old);
+        let socket1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket1.local_addr().unwrap();
+        let stop1 = CancellationToken::new();
+        let (sm1c, stop1c) = (sm1.clone(), stop1.clone());
+        let listener1 = tokio::spawn(async move {
+            let _ = run_datagram_listener(socket1, sm1c, stop1c).await;
+        });
+
+        let client = Arc::new(Muxer::new(true, "client".into()));
+        assert!(client.claim_datagram_supervisor(), "this test runs its own, faster supervisor");
+        spawn_datagram_supervisor(client.clone(), fast_timing());
+        attempt_client_datagram_leg(
+            client.clone(),
+            addr,
+            Arc::from("example.com"),
+            "client".into(),
+            root_old,
+        )
+        .await;
+        assert!(client.datagram_leg_stats().is_some(), "first leg must come up");
+
+        // The node restarts: the listener and all its state are gone ...
+        stop1.cancel();
+        let _ = listener1.await;
+        node1.shutdown(); // its leg writers hold the socket until the process is gone
+        drop(sm1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // ... and comes back on the same address with a new session and a new root.
+        let sm2 = Arc::new(SessionManager::new());
+        let node2 = Arc::new(Muxer::new(false, "node-2".into()));
+        sm2.register_datagram_session(&node2, 0, root_new);
+        let socket2 = UdpSocket::bind(addr).await.expect("the old listener released the port");
+        let stop2 = CancellationToken::new();
+        let (sm2c, stop2c) = (sm2.clone(), stop2.clone());
+        tokio::spawn(async move {
+            let _ = run_datagram_listener(socket2, sm2c, stop2c).await;
+        });
+        // The TCP reconnect hands the client the new root.
+        client.note_datagram_attempt(crate::net::connection::muxer::DatagramAttempt::new(
+            addr,
+            Arc::from("example.com"),
+            "client".into(),
+            root_new.into(),
+        ));
+
+        // The client notices the silence, builds a new leg, and the new node sees it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while node2.datagram_leg_stats().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the restarted node never got a UDP leg from the client"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // And it carries data end to end again.
+        let (stream_tx, mut stream_rx) = mpsc::channel::<Bytes>(8);
+        let stream_id = 5151u32;
+        let _t = node2.register_stream(stream_id, stream_tx);
+        let mut delivered = None;
+        for _ in 0..40 {
+            let _ = client
+                .send_to_network(MuxMessage {
+                    stream_id,
+                    frame_type: FrameType::UdpData,
+                    data: Bytes::from_static(b"after the restart"),
+                })
+                .await;
+            if let Ok(Some(got)) =
+                tokio::time::timeout(Duration::from_millis(150), stream_rx.recv()).await
+            {
+                delivered = Some(got);
+                break;
+            }
+        }
+        assert_eq!(delivered.as_deref(), Some(&b"after the restart"[..]));
+        stop2.cancel();
+        client.mark_fatal();
     }
 
     /// Два независимых клиента бьются в ОДИН И ТОТ ЖЕ слушатель одновременно

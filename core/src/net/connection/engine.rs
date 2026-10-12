@@ -384,9 +384,8 @@ impl TunnelEngine {
         }
         let claim =
             crate::crypto::DatagramKeyMaterial::derive_from_root(datagram_root, true).leg_token();
-        if !self.muxer.try_claim_datagram_leg_token(claim) {
-            return;
-        }
+        // The claim still decides whether THIS reconnect builds a leg itself ...
+        let claimed = self.muxer.try_claim_datagram_leg_token(claim);
         let muxer = self.muxer.clone();
         let remote_addr = self.remote_addr.clone();
         let decoy_sni = self.decoy_sni.clone();
@@ -401,14 +400,25 @@ impl TunnelEngine {
                 },
                 Err(_) => return,
             };
-            crate::net::connection::dgram_engine::attempt_client_datagram_leg(
-                muxer,
+            // ... but the fresh root is always remembered: it is the one the node has
+            // just registered, and the only one it can decrypt after a restart. The
+            // UDP-leg supervisor builds a new leg from it when the current one dies.
+            muxer.note_datagram_attempt(crate::net::connection::muxer::DatagramAttempt::new(
                 addr,
-                decoy_sni,
-                session_id,
+                decoy_sni.clone(),
+                session_id.clone(),
                 datagram_root,
-            )
-            .await;
+            ));
+            if claimed {
+                crate::net::connection::dgram_engine::attempt_client_datagram_leg(
+                    muxer,
+                    addr,
+                    decoy_sni,
+                    session_id,
+                    datagram_root,
+                )
+                .await;
+            }
         });
     }
 

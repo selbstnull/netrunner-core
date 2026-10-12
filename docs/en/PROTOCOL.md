@@ -689,8 +689,13 @@ as `UdpData` — nothing else is required.
 3. TCP leg (UdpData over TCP)
 ```
 
-* **One attempt per session**, no aggressive retries (UDP blocking is usually permanent). The client
-  tries one engine; if no decrypted datagram **at all** arrives within
+* **One first attempt**, no aggressive retries (UDP blocking is usually permanent), but afterwards a
+  **supervisor** keeps the leg alive: every 3 s it checks how long the node has been silent; after 8 s it
+  sends a `PING`, after 20 s (probes unanswered) it declares the leg dead and builds a new one, and a missing
+  leg is built after 10 s. Pause after failed attempts: 5 / 15 / 45 / 135 / 300 s. It builds from the freshest of
+  the last 4 `datagram_root`s (every TCP connect brings the root the node has just registered, the only one
+  it can decrypt after a restart). Without it the client kept sending on a dead leg after a node restart
+  until the session ended. The client tries one engine; if no decrypted datagram **at all** arrives within
   `DATAGRAM_LEG_HANDSHAKE_TIMEOUT = 3 s` — raw; if that is silent too — we stay on TCP. The
   establishing `PING` is resent at offsets 0 / 300 / 800 / 1500 ms.
 * There is no second handshake: keys are derived from `datagram_root` (§7.2); the server finds the

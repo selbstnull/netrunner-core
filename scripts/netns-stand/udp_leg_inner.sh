@@ -45,7 +45,7 @@ kill $SPID; wait $SPID 2>/dev/null; sleep 2; : > /dev/null; start_server
 for i in $(seq 1 60); do ip netns exec cl curl -s -m 3 -o /dev/null http://203.0.113.80:8080/small && break; sleep 1; done
 echo "tunnel back after restart: attempts=$i"
 T0=$(date +%s)
-for wait_s in 10 60 130; do
+for wait_s in 10 35 70; do
   while [ $(( $(date +%s) - T0 )) -lt $wait_s ]; do sleep 2; done
   echo; echo "=== B+${wait_s}s after the node restart"
   grep -E "UDP leg established" $D/udpleg_client.log | wc -l | sed 's/^/client log "UDP leg established" total: /'

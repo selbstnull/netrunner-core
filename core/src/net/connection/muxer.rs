@@ -448,6 +448,34 @@ pub fn adaptive_batch_chunk(base: usize) -> usize {
     base.saturating_mul(factor)
 }
 
+/// Everything a UDP-leg attempt needs, remembered so the leg can be rebuilt later
+/// (the node restarted, the leg went silent) without waiting for a network change.
+#[derive(Clone)]
+pub(crate) struct DatagramAttempt {
+    pub(crate) addr: std::net::SocketAddr,
+    pub(crate) decoy_sni: Arc<str>,
+    pub(crate) session_id: String,
+    /// The per-TCP-leg root the node registered at that leg's handshake.
+    pub(crate) root: crate::crypto::DatagramRoot,
+    token: [u8; 16],
+}
+
+impl DatagramAttempt {
+    pub(crate) fn new(
+        addr: std::net::SocketAddr,
+        decoy_sni: Arc<str>,
+        session_id: String,
+        root: crate::crypto::DatagramRoot,
+    ) -> Self {
+        let token = crate::crypto::DatagramKeyMaterial::derive_from_root(root, true).leg_token();
+        Self { addr, decoy_sni, session_id, root, token }
+    }
+
+    pub(crate) fn token(&self) -> [u8; 16] {
+        self.token
+    }
+}
+
 /// Мультиплексор туннеля. Дёшево клонируется (всё внутри `Arc`) и шарится между
 /// всеми задачами ног и потоков.
 #[derive(Clone)]
@@ -556,6 +584,16 @@ pub struct Muxer {
     /// (bug #2). На сервере это поле не используется (демультиплексирование там
     /// ведёт `SessionManager`).
     datagram_leg_token: Arc<Mutex<Option<[u8; 16]>>>,
+    /// The few most recent attempt parameters (newest first, one per distinct root).
+    /// Every TCP (re)connect brings a fresh root the node has just registered, so
+    /// after a node restart these are the only roots it can still decrypt.
+    datagram_attempts: Arc<Mutex<std::collections::VecDeque<DatagramAttempt>>>,
+    /// Signalled when a root not seen before is noted, so the supervisor retries at once.
+    datagram_attempts_changed: Arc<tokio::sync::Notify>,
+    /// Cancellation of the reader/writer tasks of the CURRENT client UDP leg only.
+    datagram_leg_tasks: Arc<Mutex<Option<CancellationToken>>>,
+    /// Whether the self-healing supervisor of this session's UDP leg is running.
+    datagram_supervisor_started: Arc<AtomicBool>,
     /// Когда в последний раз сбрасывали все ноги из-за смены сети (мс от старта
     /// процесса, 0 — ни разу). См. [`ms_since_network_change`](Self::ms_since_network_change).
     last_network_change_ms: Arc<AtomicU64>,
@@ -586,6 +624,10 @@ impl Muxer {
             datagram_leg: Arc::new(ArcSwapOption::from(None)),
             pending_udp: Arc::new(DashMap::new()),
             datagram_leg_token: Arc::new(Mutex::new(None)),
+            datagram_attempts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            datagram_attempts_changed: Arc::new(tokio::sync::Notify::new()),
+            datagram_leg_tasks: Arc::new(Mutex::new(None)),
+            datagram_supervisor_started: Arc::new(AtomicBool::new(false)),
             last_network_change_ms: Arc::new(AtomicU64::new(0)),
         };
         muxer.spawn_backlog_reaper();
@@ -950,6 +992,95 @@ impl Muxer {
         } else {
             *guard = Some(token);
             true
+        }
+    }
+
+    /// Remembers the parameters of a UDP-leg attempt (one entry per distinct root,
+    /// newest first, at most 4). A root not seen before wakes the supervisor.
+    pub(crate) fn note_datagram_attempt(&self, attempt: DatagramAttempt) {
+        let is_new = {
+            let mut attempts = self.datagram_attempts.lock().unwrap();
+            if let Some(known) = attempts.iter_mut().find(|a| a.token == attempt.token) {
+                // Same root: keep its place, refresh the address (DNS/roaming).
+                known.addr = attempt.addr;
+                false
+            } else {
+                attempts.push_front(attempt);
+                attempts.truncate(4);
+                true
+            }
+        };
+        if is_new {
+            self.datagram_attempts_changed.notify_one();
+        }
+    }
+
+    /// Remembered attempts, newest first.
+    pub(crate) fn datagram_attempt_candidates(&self) -> Vec<DatagramAttempt> {
+        self.datagram_attempts.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub(crate) fn datagram_attempts_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.datagram_attempts_changed.clone()
+    }
+
+    /// `true` for the first caller only: that caller starts the supervisor.
+    pub(crate) fn claim_datagram_supervisor(&self) -> bool {
+        !self.datagram_supervisor_started.swap(true, Ordering::AcqRel)
+    }
+
+    /// Starts the task token of a new client UDP leg (a child of the network-epoch
+    /// token) and cancels the previous leg's tasks, so a replaced leg's reader and
+    /// writer stop instead of lingering on a dead socket.
+    pub(crate) fn begin_datagram_leg_tasks(&self) -> CancellationToken {
+        let token = self.network_epoch_token().child_token();
+        if let Some(old) = self.datagram_leg_tasks.lock().unwrap().replace(token.clone()) {
+            old.cancel();
+        }
+        token
+    }
+
+    pub(crate) fn cancel_datagram_leg_tasks(&self) {
+        if let Some(old) = self.datagram_leg_tasks.lock().unwrap().take() {
+            old.cancel();
+        }
+    }
+
+    /// How long the UDP leg has gone without any datagram from the node; `None`
+    /// when there is no leg. A leg that was never heard from reports zero (it was
+    /// just created; the establishing round trip counts as the first sign of life).
+    pub(crate) fn datagram_leg_silence(&self) -> Option<Duration> {
+        let leg = self.datagram_leg.load_full()?;
+        let last = leg.stats.last_pong_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_millis(process_uptime_ms().saturating_sub(last)))
+    }
+
+    /// Queues a liveness PING on the UDP leg; a live node answers with a PONG.
+    pub(crate) fn ping_datagram_leg(&self) -> bool {
+        let Some(leg) = self.datagram_leg.load_full() else {
+            return false;
+        };
+        leg.control_tx
+            .try_send(MuxMessage {
+                stream_id: 0,
+                frame_type: FrameType::Heartbeat,
+                data: Bytes::from_static(b"PING"),
+            })
+            .is_ok()
+    }
+
+    /// Clears the UDP leg only if it is still the one owning `control_tx`: a stale
+    /// reader finishing late must not wipe the leg that replaced its own.
+    pub fn clear_datagram_leg_if(&self, control_tx: &Sender<MuxMessage>) -> bool {
+        match self.datagram_leg.load_full() {
+            Some(leg) if leg.control_tx.same_channel(control_tx) => {
+                self.clear_datagram_leg();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2784,16 +2915,9 @@ mod scheduling_tests {
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
         let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
         muxer.set_datagram_leg(control_tx, data_tx);
-        muxer
-            .datagram_leg_stats()
-            .unwrap()
-            .last_pong_ms
-            // Не `process_uptime_ms()`: в первую же миллисекунду свежего
-            // тестового процесса он сам может вернуть 0, что неотличимо от
-            // "PONG ещё не приходил" (см. докстринг `last_pong_ms`/
-            // `datagram_leg_is_fresh`) — гарантированно ненулевое значение
-            // тестирует именно "недавно" вне этой гонки.
-            .store(1, Ordering::Relaxed);
+        // `mark_datagram_leg_alive` stamps the real clock (never 0), so the leg is fresh
+        // whatever the process uptime: a fixed 1 ms went stale after 45 s of test run.
+        muxer.mark_datagram_leg_alive();
 
         let selected = muxer.select_udp_leg(99, 100).unwrap();
         assert_eq!(selected.id, DATAGRAM_LEG_ID);
@@ -2869,16 +2993,9 @@ mod scheduling_tests {
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
         let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
         muxer.set_datagram_leg(control_tx, data_tx);
-        muxer
-            .datagram_leg_stats()
-            .unwrap()
-            .last_pong_ms
-            // Не `process_uptime_ms()`: в первую же миллисекунду свежего
-            // тестового процесса он сам может вернуть 0, что неотличимо от
-            // "PONG ещё не приходил" (см. докстринг `last_pong_ms`/
-            // `datagram_leg_is_fresh`) — гарантированно ненулевое значение
-            // тестирует именно "недавно" вне этой гонки.
-            .store(1, Ordering::Relaxed);
+        // `mark_datagram_leg_alive` stamps the real clock (never 0), so the leg is fresh
+        // whatever the process uptime: a fixed 1 ms went stale after 45 s of test run.
+        muxer.mark_datagram_leg_alive();
         assert_eq!(muxer.select_udp_leg(99, 100).unwrap().id, DATAGRAM_LEG_ID);
 
         muxer.clear_datagram_leg();
@@ -2894,11 +3011,7 @@ mod scheduling_tests {
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
         let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
         muxer.set_datagram_leg(control_tx, data_tx);
-        muxer
-            .datagram_leg_stats()
-            .unwrap()
-            .last_pong_ms
-            .store(1, Ordering::Relaxed);
+        muxer.mark_datagram_leg_alive(); // fresh now, whatever the process uptime
 
         // В пределах потолка — native.
         assert_eq!(
@@ -2919,6 +3032,66 @@ mod scheduling_tests {
         );
     }
 
+    /// The remembered attempt roots: one entry per distinct root, newest first,
+    /// bounded; a root not seen before wakes the supervisor, a repeat does not.
+    #[tokio::test]
+    async fn attempt_roots_are_remembered_newest_first_without_duplicates() {
+        let muxer = Muxer::new(true, "attempts".into());
+        let addr: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let note = |byte: u8| {
+            muxer.note_datagram_attempt(DatagramAttempt::new(
+                addr,
+                Arc::from("example.com"),
+                "s".into(),
+                [byte; 32].into(),
+            ))
+        };
+        let changed = muxer.datagram_attempts_changed();
+        note(1);
+        tokio::time::timeout(Duration::from_millis(50), changed.notified())
+            .await
+            .expect("a new root wakes the supervisor");
+        note(2);
+        note(1); // a repeat keeps its place and does not wake anyone
+        let order: Vec<_> = muxer.datagram_attempt_candidates().iter().map(|a| a.token()).collect();
+        assert_eq!(order.len(), 2);
+        let first = DatagramAttempt::new(addr, Arc::from("x"), "s".into(), [2u8; 32].into()).token();
+        assert_eq!(order[0], first, "newest distinct root first");
+        for byte in 3..=9 {
+            note(byte);
+        }
+        assert_eq!(muxer.datagram_attempt_candidates().len(), 4, "bounded");
+    }
+
+    /// A reader of a replaced leg finishing late must not clear the new leg.
+    #[tokio::test]
+    async fn a_stale_leg_owner_cannot_clear_the_leg_that_replaced_it() {
+        let muxer = muxer_with_two_legs();
+        let (old_control, _o1) = tokio::sync::mpsc::channel(8);
+        let (old_data, _o2) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg(old_control.clone(), old_data);
+        let (new_control, _n1) = tokio::sync::mpsc::channel(8);
+        let (new_data, _n2) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg(new_control.clone(), new_data);
+
+        assert!(!muxer.clear_datagram_leg_if(&old_control));
+        assert!(muxer.datagram_leg_stats().is_some(), "the new leg survives");
+        assert!(muxer.clear_datagram_leg_if(&new_control));
+        assert!(muxer.datagram_leg_stats().is_none());
+    }
+
+    /// Replacing a leg cancels the previous leg's tasks, not the new ones.
+    #[tokio::test]
+    async fn starting_a_leg_cancels_the_previous_legs_tasks() {
+        let muxer = Muxer::new(true, "tasks".into());
+        let first = muxer.begin_datagram_leg_tasks();
+        let second = muxer.begin_datagram_leg_tasks();
+        assert!(first.is_cancelled());
+        assert!(!second.is_cancelled());
+        muxer.cancel_datagram_leg_tasks();
+        assert!(second.is_cancelled());
+    }
+
     /// A QUIC connection's datagram size starts at ~1160 and grows after MTU
     /// probing: the leg's ceiling must follow it, so a packet that did not fit at
     /// attach time uses the datagram leg once the path allows it.
@@ -2928,11 +3101,7 @@ mod scheduling_tests {
         let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
         let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
         muxer.set_datagram_leg_path_validated(control_tx, data_tx.clone(), 1100);
-        muxer
-            .datagram_leg_stats()
-            .unwrap()
-            .last_pong_ms
-            .store(1, Ordering::Relaxed);
+        muxer.mark_datagram_leg_alive(); // fresh now, whatever the process uptime
 
         // A 1250-byte QUIC packet does not fit the initial 1100 ceiling ...
         assert_ne!(muxer.select_udp_leg(7, 1250).unwrap().id, DATAGRAM_LEG_ID);
@@ -2962,11 +3131,7 @@ mod scheduling_tests {
         let (control_tx, control_rx) = tokio::sync::mpsc::channel(8);
         let (data_tx, data_rx) = tokio::sync::mpsc::channel(8);
         muxer.set_datagram_leg(control_tx, data_tx);
-        muxer
-            .datagram_leg_stats()
-            .unwrap()
-            .last_pong_ms
-            .store(1, Ordering::Relaxed); // «свежая»
+        muxer.mark_datagram_leg_alive(); // fresh now, whatever the process uptime
                                           // Писатель мёртв: роняем приёмники, канал закрыт.
         drop(control_rx);
         drop(data_rx);
