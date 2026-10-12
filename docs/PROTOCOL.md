@@ -711,8 +711,9 @@ AEAD-открытого текста). Целостность, порядок и
   обслуживает все сессии; адрес пира читается на каждую отправку (роуминг за NAT).
 * Классификация входящей датаграммы по первому байту: диапазоны QUIC short header /
   RTP (`128..191`, RFC 7983) / остальное (raw).
-* Кадр `UdpData` > `MAX_DATAGRAM_LEG_PAYLOAD = 1150` Б уходит по TCP (без
-  фрагментации); внешний UDP-пейлоад целится в ~1250 Б.
+* Кадр `UdpData` > `MAX_DATAGRAM_LEG_PAYLOAD = 1200` Б (минимальная датаграмма QUIC) уходит по TCP (без
+  фрагментации); внешний UDP-пейлоад при потолке — 1262 Б. Приём потолком не ограничен: пиры со старым потолком 1150
+  принимают такие датаграммы без изменений.
 * Ранний `UdpData` может обогнать свой `UdpConnect` (тот едет по TCP): сервер
   буферизует до 256 потоков × 16 КиБ × 2 с.
 
@@ -988,7 +989,7 @@ Chrome 140 (JA3/JA4 ротируются перемешиванием расши
 | `CREDIT_INITIAL_WINDOW` / `MIN` / `MAX` / `GLOBAL_BUDGET` | 1 МиБ / 256 КиБ / 16 МиБ / 64 МиБ | `net/credit.rs` |
 | `CREDIT_STALL_FALLBACK` | 600 с | `net/constants.rs` |
 | `DATAGRAM_LEG_HANDSHAKE_TIMEOUT` | 3 с | `net/constants.rs` |
-| `MAX_DATAGRAM_LEG_PAYLOAD` | 1150 Б | `net/constants.rs` |
+| `MAX_DATAGRAM_LEG_PAYLOAD` | 1200 Б | `net/constants.rs` |
 | `DATAGRAM_KEEPALIVE_MIN` / `MAX` | 15 / 25 с | `net/constants.rs` |
 | `REKEY_AFTER_DATAGRAMS` / `STREAM_REKEY_AFTER_RECORDS` | 2²⁰ / 2²⁰ (AES-GCM) | `nrxp/datagram.rs`, `crypto/chacha.rs` |
 | окно анти-повтора датаграмм | 2048 | `nrxp/datagram.rs` |
