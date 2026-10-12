@@ -25,6 +25,7 @@ Emitted exactly once when a stream a client opened through this node goes away.
 | `duration_ms`, `first_byte_ms` | lifetime; time to the first byte sent back (`-1` = none) |
 | `up_bytes`, `down_bytes` | client→destination / destination→client (TCP and UDP datagrams) |
 | `credit_stall_ms`, `credit_stalls` | time the sender sat blocked on the client's flow-control window |
+| `name_tag` | on failed streams with a host-name target only: keyed, daily-rotating tag of the host (see below), `-` otherwise |
 
 Reading it: a video that "hangs" shows up as a long `duration_ms` with a large
 `credit_stall_ms` (the client stopped granting window), or `first_byte_ms=-1`
@@ -77,3 +78,28 @@ name behind each one. A flow whose target shows up at an exit as a literal IPv4
 `outcome="egress_exhausted"`, ~7 s per exit) is the signature of a fake IP that lost
 its name. The client now resets such a connection at once and the exit refuses
 `100.64.0.0/10` and `198.18.0.0/15` outright (`dial="blocked"`).
+
+## Which path does UDP/QUIC take?
+
+Every UDP datagram is counted where the leg is chosen (`select_udp_leg`):
+
+* `netrunner_udp_path_total{path,reason}`: `path` is `native` (the UDP leg or the
+  mesh-QUIC DATAGRAM leg) or `tcp` (carried inside the reliable legs / QUIC stream);
+  `reason` is `ok`, `no_leg` (no native leg in the session), `stale` (no pong on the
+  native leg for 45 s) or `oversize` (payload larger than the leg's ceiling).
+* `netrunner_udp_oversize_total{size}`: the same oversize datagrams by size class
+  (`1201-1252`, `1253-1350`, `over-1350`), i.e. what the ceiling would have to be.
+* `netrunner_mesh_datagram_ceiling_bytes`: current ceiling of the node-to-node leg.
+
+A node-to-node QUIC connection starts at ~1160 bytes per DATAGRAM and grows to
+~1410 once its path MTU has been probed; the leg's ceiling used to be read once at
+attach time (1100) and so sent every larger packet down the reliable stream. It now
+follows the connection (re-read every 500 ms for 30 s, then every 10 s).
+
+## Names of failed streams
+
+Stream summaries never contain the destination. For a stream that failed to a
+host *name* the line carries `name_tag = hex(HMAC-SHA256(PROXY_NRXP_SECRET,
+"<days since epoch>:<lowercase host>"))[..12]`: the same host gives the same tag all
+day on that node and a different one tomorrow or elsewhere. To check a suspect, run
+`scripts/name-tag.sh example.com` on the node and grep the tag.

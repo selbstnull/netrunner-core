@@ -991,6 +991,57 @@ impl Muxer {
         info!("MUXER: Physical UDP leg registered");
     }
 
+    /// Like [`set_datagram_leg_with_max_payload`](Self::set_datagram_leg_with_max_payload)
+    /// but without the static [`MAX_DATAGRAM_LEG_PAYLOAD`] cap, for transports that
+    /// validate their own path MTU (mesh QUIC): their ceiling is whatever the
+    /// connection currently allows, and `update_datagram_leg_max_payload` keeps it
+    /// current.
+    pub fn set_datagram_leg_path_validated(
+        &self,
+        control_tx: Sender<MuxMessage>,
+        data_tx: Sender<MuxMessage>,
+        max_payload: usize,
+    ) {
+        self.datagram_leg.store(Some(Arc::new(MuxLeg {
+            id: DATAGRAM_LEG_ID,
+            control_tx,
+            data_tx,
+            stats: Arc::new(LegStats::default()),
+            max_datagram_payload: max_payload,
+        })));
+        info!("MUXER: Physical UDP leg registered");
+    }
+
+    /// The size ceiling of the current datagram leg, if there is one.
+    #[cfg(test)]
+    pub(crate) fn datagram_leg_max_payload(&self) -> Option<usize> {
+        self.datagram_leg.load_full().map(|leg| leg.max_datagram_payload)
+    }
+
+    /// Moves the size ceiling of the current datagram leg (the one owning `data_tx`)
+    /// to `max_payload`. A QUIC connection starts at a 1200-byte path MTU and only
+    /// grows after probing, so a ceiling read once at attach time stays low forever
+    /// and sends every larger UDP packet down the reliable stream instead.
+    /// Returns whether the leg was still the same one.
+    pub fn update_datagram_leg_max_payload(
+        &self,
+        data_tx: &Sender<MuxMessage>,
+        max_payload: usize,
+    ) -> bool {
+        let Some(current) = self.datagram_leg.load_full() else {
+            return false;
+        };
+        if !current.data_tx.same_channel(data_tx) {
+            return false;
+        }
+        if current.max_datagram_payload != max_payload {
+            let mut next = (*current).clone();
+            next.max_datagram_payload = max_payload;
+            self.datagram_leg.store(Some(Arc::new(next)));
+        }
+        true
+    }
+
     /// Снимает UDP-ногу (эвикт по мёртвому health-check'у или физическая
     /// смерть движка) — `select_udp_leg` немедленно откатывается на
     /// TCP-переносимый фолбэк для следующей же датаграммы, ничего больше
@@ -1117,6 +1168,27 @@ impl Muxer {
     /// ([`select_udp_leg_over_tcp`](Self::select_udp_leg_over_tcp), прежняя
     /// реализация этого метода целиком).
     fn select_udp_leg(&self, stream_id: u32, payload_len: usize) -> Option<MuxLeg> {
+        // Every datagram is counted by the path it takes and, when it does not take
+        // the native leg, why. This is the only place that decides it, so the
+        // counters answer "why does QUIC ride TCP?" without guessing.
+        let reason = match self.datagram_leg.load_full() {
+            None => "no_leg",
+            Some(native) if payload_len > native.max_datagram_payload => {
+                // Which size class overflowed shows what the ceiling should be.
+                let class = match payload_len {
+                    0..=1252 => "1201-1252",
+                    1253..=1350 => "1253-1350",
+                    _ => "over-1350",
+                };
+                metrics::counter!("netrunner_udp_oversize_total", "size" => class).increment(1);
+                "oversize"
+            }
+            Some(native) if !self.datagram_leg_is_fresh(&native) => "stale",
+            Some(_) => "ok",
+        };
+        let path = if reason == "ok" { "native" } else { "tcp" };
+        metrics::counter!("netrunner_udp_path_total", "path" => path, "reason" => reason)
+            .increment(1);
         if let Some(native) = self.datagram_leg.load_full() {
             // Кадр, не влезающий в потолок физической датаграммы, НЕ отдаём на
             // native-ногу: её писатель отправил бы его одной UDP-датаграммой,
@@ -1856,6 +1928,13 @@ impl Muxer {
                     credit,
                 },
             );
+        }
+    }
+
+    /// Attaches the keyed tag of a destination host name (printed only on failure).
+    pub fn trace_name(&self, stream_id: u32, tag: String) {
+        if let Some(mut entry) = self.traces.get_mut(&stream_id) {
+            entry.trace.name_tag = Some(tag);
         }
     }
 
@@ -2838,6 +2917,38 @@ mod scheduling_tests {
             DATAGRAM_LEG_ID,
             "кадр больше потолка не должен уходить на физическую UDP-ногу"
         );
+    }
+
+    /// A QUIC connection's datagram size starts at ~1160 and grows after MTU
+    /// probing: the leg's ceiling must follow it, so a packet that did not fit at
+    /// attach time uses the datagram leg once the path allows it.
+    #[tokio::test]
+    async fn the_datagram_ceiling_can_grow_after_attach() {
+        let muxer = muxer_with_two_legs();
+        let (control_tx, _control_rx) = tokio::sync::mpsc::channel(8);
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+        muxer.set_datagram_leg_path_validated(control_tx, data_tx.clone(), 1100);
+        muxer
+            .datagram_leg_stats()
+            .unwrap()
+            .last_pong_ms
+            .store(1, Ordering::Relaxed);
+
+        // A 1250-byte QUIC packet does not fit the initial 1100 ceiling ...
+        assert_ne!(muxer.select_udp_leg(7, 1250).unwrap().id, DATAGRAM_LEG_ID);
+        // ... but does after the path MTU was probed and the ceiling followed it.
+        assert!(muxer.update_datagram_leg_max_payload(&data_tx, 1352));
+        assert_eq!(muxer.select_udp_leg(7, 1250).unwrap().id, DATAGRAM_LEG_ID);
+        assert_eq!(muxer.select_udp_leg(7, 1352).unwrap().id, DATAGRAM_LEG_ID);
+        assert_ne!(muxer.select_udp_leg(7, 1353).unwrap().id, DATAGRAM_LEG_ID);
+
+        // A different leg's channel, or no leg at all, is not touched.
+        let (_other_control, _rx1) = tokio::sync::mpsc::channel::<MuxMessage>(1);
+        let (other_data, _rx2) = tokio::sync::mpsc::channel::<MuxMessage>(1);
+        assert!(!muxer.update_datagram_leg_max_payload(&other_data, 9999));
+        assert_eq!(muxer.select_udp_leg(7, 1353).unwrap().id != DATAGRAM_LEG_ID, true);
+        muxer.clear_datagram_leg();
+        assert!(!muxer.update_datagram_leg_max_payload(&data_tx, 1352));
     }
 
     /// Регрессия на bug #6: если писатель native-ноги умер (его приёмники

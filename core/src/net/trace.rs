@@ -165,6 +165,9 @@ pub struct StreamTrace {
     pub attempts: u8,
     /// Milliseconds from open to the first byte coming back, if any did.
     pub first_byte_ms: Option<u64>,
+    /// Keyed, daily-rotating tag of the destination host name (see [`name_tag`]).
+    /// Only ever printed for streams that failed.
+    pub name_tag: Option<String>,
 }
 
 impl StreamTrace {
@@ -179,6 +182,7 @@ impl StreamTrace {
             dial_kind: None,
             attempts: 0,
             first_byte_ms: None,
+            name_tag: None,
         }
     }
 }
@@ -235,6 +239,7 @@ pub fn emit_stream_closed(session_id: &str, stream_id: u32, trace: &StreamTrace,
                 down_bytes = totals.down_bytes,
                 credit_stall_ms = totals.credit_stall_ms,
                 credit_stalls = totals.credit_stalls,
+                name_tag = trace.name_tag.as_deref().unwrap_or("-"),
                 "tunnel stream closed"
             );
         } else {
@@ -262,6 +267,38 @@ pub fn emit_stream_closed(session_id: &str, stream_id: u32, trace: &StreamTrace,
     line(failed);
 }
 
+/// A short tag for a destination host name, so repeated failures to the same
+/// unknown host can be grouped without ever storing the name itself.
+///
+/// `tag = hex(HMAC-SHA256(key, "<days since epoch>:<lowercase host>"))[..12]`. The
+/// key is this node's entry secret (`PROXY_NRXP_SECRET`) or, without one, random
+/// per process, and the day is part of the message, so the same name has a
+/// different tag every day and tags cannot be matched across nodes or days.
+/// An operator who suspects a host recomputes its tag with
+/// `scripts/name-tag.sh <host>` on the node. Port and any `user@` are dropped.
+pub fn name_tag(target: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use std::sync::OnceLock;
+    static KEY: OnceLock<Vec<u8>> = OnceLock::new();
+    let key = KEY.get_or_init(|| match std::env::var("PROXY_NRXP_SECRET") {
+        Ok(secret) if !secret.is_empty() => secret.into_bytes(),
+        _ => (0..32).map(|_| rand::random::<u8>()).collect(),
+    });
+    let host = target
+        .rsplit_once(':')
+        .map(|(host, port)| if port.chars().all(|c| c.is_ascii_digit()) { host } else { target })
+        .unwrap_or(target)
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
+    let day = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0);
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(format!("{day}:{host}").as_bytes());
+    hex::encode(&mac.finalize().into_bytes()[..6])
+}
+
 /// Counts a failed dial. Called once per failed attempt, whichever path made it.
 pub fn count_dial_failure(proto: Proto, family: Family, kind: DialKind) {
     metrics::counter!(
@@ -281,6 +318,15 @@ mod tests {
         assert_eq!(target_family("[2a03:2880:f20a:e5::4420]:443"), Family::V6);
         assert_eq!(target_family("2a03:2880::1:443"), Family::V6);
         assert_eq!(target_family("example.com:443"), Family::Name);
+    }
+
+    #[test]
+    fn name_tags_are_stable_per_name_and_hide_the_name() {
+        let a = name_tag("Example.COM:443");
+        assert_eq!(a, name_tag("example.com:8443"), "case and port do not matter");
+        assert_ne!(a, name_tag("example.org:443"));
+        assert_eq!(a.len(), 12);
+        assert!(!a.contains("example"));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::net::{
         dial,
         muxer::Muxer,
     },
-    trace::{target_family, DialKind, Family, Proto, Route},
+    trace::{self, target_family, DialKind, Family, Proto, Route},
     MeshRoute, NetworkConfig,
 };
 use crate::nrxp::{Frame, FrameType};
@@ -1369,6 +1369,9 @@ async fn run_mesh_onion_exit(
     // This node is the exit: the destination is known here, so record its
     // family (only the family) and count the dial.
     muxer.trace_family(stream_id, target_family(&target));
+    if target_family(&target) == Family::Name {
+        muxer.trace_name(stream_id, trace::name_tag(&target));
+    }
     muxer.trace_attempt(stream_id);
     if is_udp {
         let dialed = tokio::select! {
@@ -2040,6 +2043,9 @@ impl StreamHandler {
                 target_family(&target),
                 strong_privacy,
             );
+            if target_family(&target) == Family::Name {
+                self.muxer.trace_name(stream_id, trace::name_tag(&target));
+            }
 
             if is_udp {
                 opener

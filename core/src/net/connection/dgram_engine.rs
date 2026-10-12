@@ -164,9 +164,9 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
         metrics::counter!("netrunner_mesh_quic_datagram_unavailable_total").increment(1);
         return;
     };
-    let max_payload = max_datagram
-        .saturating_sub(crate::rawdgram::RAW_DGRAM_OVERHEAD)
-        .min(crate::net::MAX_DATAGRAM_LEG_PAYLOAD);
+    // No static cap here: QUIC validates the path MTU itself and refuses an
+    // oversize DATAGRAM, and the ceiling is refreshed below as the MTU is probed.
+    let max_payload = max_datagram.saturating_sub(crate::rawdgram::RAW_DGRAM_OVERHEAD);
     if max_payload == 0 {
         metrics::counter!("netrunner_mesh_quic_datagram_unavailable_total").increment(1);
         return;
@@ -175,9 +175,40 @@ pub(crate) fn attach_mesh_quic_datagram_leg(
     let cap = NetworkConfig::global().channel_capacity;
     let (control_tx, mut control_rx) = mpsc::channel::<MuxMessage>(cap);
     let (data_tx, mut data_rx) = mpsc::channel::<MuxMessage>(cap);
-    muxer.set_datagram_leg_with_max_payload(control_tx.clone(), data_tx, max_payload);
+    muxer.set_datagram_leg_path_validated(control_tx.clone(), data_tx.clone(), max_payload);
     muxer.mark_datagram_leg_alive();
     let (mut tx, mut rx) = build_raw_pair(datagram_root.into(), is_client);
+
+    // A fresh QUIC connection allows only ~1160 bytes per DATAGRAM and grows to
+    // ~1410 once the path MTU has been probed. Follow it, quickly at first and then
+    // lazily, so packets above the initial limit use DATAGRAM instead of the
+    // reliable stream.
+    {
+        let probe_muxer = muxer.clone();
+        let probe_connection = connection.clone();
+        let probe_tx = data_tx;
+        let probe_token = muxer.network_epoch_token().child_token();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            loop {
+                let pause = if started.elapsed() < Duration::from_secs(30) {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(10)
+                };
+                tokio::select! {
+                    _ = probe_token.cancelled() => break,
+                    _ = tokio::time::sleep(pause) => {}
+                }
+                let Some(current) = probe_connection.max_datagram_size() else { break };
+                let ceiling = current.saturating_sub(crate::rawdgram::RAW_DGRAM_OVERHEAD);
+                if !probe_muxer.update_datagram_leg_max_payload(&probe_tx, ceiling) {
+                    break;
+                }
+                metrics::gauge!("netrunner_mesh_datagram_ceiling_bytes").set(ceiling as f64);
+            }
+        });
+    }
 
     let token = muxer.network_epoch_token().child_token();
     let reader_token = token.clone();
@@ -1094,6 +1125,46 @@ fn build_matching_tx(rx: &DgramRx, datagram_root: impl Into<DatagramRoot>) -> Dg
             let material = DatagramKeyMaterial::derive_from_root_ctx(datagram_root, false, ctx);
             DgramTx::Raw(rawdgram::RawDgramTx::new(CoreDatagramTx::new(material)))
         }
+    }
+}
+
+#[cfg(all(test, feature = "mesh-quic"))]
+mod mesh_quic_ceiling_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// End to end on a real QUIC connection: the datagram leg starts with the
+    /// ceiling QUIC allows at that moment and follows it up as the path MTU is
+    /// probed, so a 1250-byte packet ends up carried as a DATAGRAM instead of on
+    /// the reliable stream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_mesh_leg_ceiling_follows_the_probed_path_mtu() {
+        crate::net::NetworkConfig::init_global(1500);
+        let server = crate::net::mesh_quic::server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = crate::net::mesh_quic::client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+
+        let server_conn = tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() });
+        let client_conn = client.connect(addr, "mesh.netrunner").unwrap().await.unwrap();
+        let server_conn = server_conn.await.unwrap();
+
+        let muxer = Arc::new(Muxer::new(true, "mesh-ceiling".into()));
+        let handler = Arc::new(StreamHandler::new(muxer.clone(), None));
+        attach_mesh_quic_datagram_leg(muxer.clone(), client_conn.clone(), handler, [7u8; 32], true);
+        tokio::spawn(async move { while server_conn.read_datagram().await.is_ok() {} });
+        let initial = muxer.datagram_leg_max_payload().expect("leg attached");
+
+        let started = std::time::Instant::now();
+        let mut grown = initial;
+        while started.elapsed() < Duration::from_secs(10) && grown < 1250 {
+            let _ = client_conn.send_datagram(bytes::Bytes::from(vec![0u8; 900]));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            grown = muxer.datagram_leg_max_payload().unwrap_or(grown);
+        }
+        assert!(
+            grown >= 1250,
+            "the ceiling stayed at {grown} (started at {initial}) although the path allows more"
+        );
     }
 }
 

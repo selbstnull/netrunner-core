@@ -217,6 +217,41 @@ mod tests {
         );
     }
 
+    /// What datagram size does a fresh mesh QUIC connection allow, and how does it
+    /// change once the path MTU has been probed? The datagram leg takes its size
+    /// ceiling from `max_datagram_size()` once, when it is attached.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mesh_quic_datagram_size_at_attach_versus_after_mtu_probing() {
+        let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = client_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let (_s, mut r) = connection.accept_bi().await.unwrap();
+            let mut buf = [0u8; 4];
+            let _ = r.read_exact(&mut buf).await;
+            while connection.read_datagram().await.is_ok() {}
+        });
+        let connection = client.connect(addr, "mesh.netrunner").unwrap().await.unwrap();
+        let at_attach = connection.max_datagram_size();
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        // Keep the path busy so MTU probes run, then look again.
+        for _ in 0..400 {
+            let _ = connection.send_datagram(Bytes::from(vec![0u8; 900]));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let later = connection.max_datagram_size();
+        println!(
+            "mesh QUIC max_datagram_size: at attach = {at_attach:?}, after probing = {later:?}, \
+             leg ceiling uses at attach: {:?}",
+            at_attach.map(|m| m.saturating_sub(crate::rawdgram::RAW_DGRAM_OVERHEAD)
+                .min(crate::net::MAX_DATAGRAM_LEG_PAYLOAD))
+        );
+        drop(connection);
+        server_task.abort();
+    }
+
     #[tokio::test]
     async fn mesh_quic_negotiates_streams_and_datagrams_with_ephemeral_tls() {
         let server = server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
