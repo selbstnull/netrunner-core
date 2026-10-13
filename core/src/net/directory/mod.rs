@@ -209,6 +209,14 @@ impl Directory {
         self.len() == 0
     }
 
+    /// Снимок живых записей (для панели управления).
+    pub fn records(&self, now: u64) -> Vec<NodeDescriptor> {
+        let g = self.inner.lock().unwrap();
+        let mut v: Vec<NodeDescriptor> = g.store.live(now).cloned().collect();
+        v.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        v
+    }
+
     pub fn gc(&self, now: u64) -> usize {
         self.inner.lock().unwrap().store.gc(now)
     }

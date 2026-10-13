@@ -124,6 +124,7 @@ panics at startup.
 | `--mesh-enabled`, `--mesh-max-hops`, `--mesh-quic-port` | off, `2`, `8443` | mesh (§11) |
 | `--health-port` | off | `/health`, `127.0.0.1` only |
 | `--metrics-port` | off | Prometheus `/metrics`, on **`0.0.0.0`** |
+| `--admin-port`, `--admin-dir` | off, `./netrunner-admin` | local admin panel: listens on **`127.0.0.1` only**, token in `<admin-dir>/admin.token`; from your PC `ssh -L 4444:127.0.0.1:4444 user@node`, see [server/README.MD](../../server/README.MD) |
 
 Environment variables:
 

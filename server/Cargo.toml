@@ -22,3 +22,6 @@ dashmap = "6.1.0"
 metrics = "0.24.3"
 metrics-exporter-prometheus = { version = "0.18.1", default-features = false }
 uuid = { version = "1", features = ["serde", "v4"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+subtle = "2.6"
+sha2 = "0.10"

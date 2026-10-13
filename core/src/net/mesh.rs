@@ -1003,6 +1003,11 @@ impl NodeMesh {
         candidates.into_iter().map(|(peer, _)| peer).collect()
     }
 
+    /// Свежий замер RTT до пира, мс (`None` — не замерен или устарел).
+    pub fn peer_rtt_ms(&self, node_id: &str) -> Option<u32> {
+        self.recent_rtt_ms(node_id)
+    }
+
     fn recent_rtt_ms(&self, node_id: &str) -> Option<u32> {
         self.rtt_ms
             .get(&node_id.to_ascii_lowercase())
