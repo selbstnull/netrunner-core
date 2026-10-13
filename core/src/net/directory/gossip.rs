@@ -29,6 +29,12 @@ const MAX_WANT: usize = 256;
 const TAG_DIGEST: u8 = 1;
 const TAG_REPLY: u8 = 2;
 const TAG_PUSH: u8 = 3;
+/// Клиент просит у узла несколько соседей (`PeerHint`).
+const TAG_HINT_REQUEST: u8 = 4;
+/// Ответ на `PeerHint`: только записи.
+const TAG_HINT_REPLY: u8 = 5;
+/// Не больше стольких записей за один `PeerHint`.
+pub const MAX_HINT_RECORDS: u8 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -38,6 +44,9 @@ pub enum Message {
         want: Vec<NodeId>,
     },
     Push(Vec<NodeDescriptor>),
+    /// `PeerHint`: клиент узла просит до `max` записей о других узлах.
+    HintRequest { max: u8 },
+    HintReply(Vec<NodeDescriptor>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +103,14 @@ impl Message {
                 out.push(TAG_PUSH);
                 put_records(&mut out, records);
             }
+            Self::HintRequest { max } => {
+                out.push(TAG_HINT_REQUEST);
+                out.push(*max);
+            }
+            Self::HintReply(records) => {
+                out.push(TAG_HINT_REPLY);
+                put_records(&mut out, records);
+            }
         }
         out
     }
@@ -131,6 +148,10 @@ impl Message {
                 Self::Reply { records, want }
             }
             TAG_PUSH => Self::Push(r.records()?),
+            TAG_HINT_REQUEST => Self::HintRequest {
+                max: r.arr::<1>()?[0].min(MAX_HINT_RECORDS),
+            },
+            TAG_HINT_REPLY => Self::HintReply(r.records()?),
             t => return Err(GossipError::UnknownTag(t)),
         };
         if r.p != r.b.len() {
@@ -141,7 +162,12 @@ impl Message {
 
     /// Это сообщение — запрос, на который отвечают (а не ответ).
     pub fn is_request(&self) -> bool {
-        matches!(self, Self::Digest(_))
+        matches!(self, Self::Digest(_) | Self::HintRequest { .. })
+    }
+
+    /// Ответ на наш запрос: его ждёт поток, открытый отправителем запроса.
+    pub fn is_reply(&self) -> bool {
+        matches!(self, Self::Reply { .. } | Self::HintReply(_))
     }
 }
 
@@ -324,6 +350,50 @@ pub fn finish(
 pub fn absorb(store: &mut DescriptorStore, push: Message, now: u64) -> Result<Stats, GossipError> {
     let Message::Push(records) = push else {
         return Err(GossipError::Malformed("expected a push"));
+    };
+    Ok(count(store, records, now))
+}
+
+/// Случайные записи для `PeerHint`: живые, пересказываемые, с ролью ретранслятора
+/// (адреса мостов клиенту не отдаются так же, как и соседям); своя запись — в общем
+/// пуле. Размер ответа ограничен кадром.
+pub fn hint_records(
+    store: &DescriptorStore,
+    own: Option<&NodeDescriptor>,
+    max: u8,
+    now: u64,
+) -> Vec<NodeDescriptor> {
+    use rand::RngExt;
+    let mut pool: Vec<&NodeDescriptor> = shareable(store, own, now)
+        .into_iter()
+        .filter(|d| d.roles.has(super::descriptor::Roles::RELAY))
+        .collect();
+    // Fisher–Yates: каждый клиент видит свой случайный срез, а не «первых по id».
+    for i in (1..pool.len()).rev() {
+        pool.swap(i, rand::rng().random_range(0..=i));
+    }
+    pool.truncate(max.min(MAX_HINT_RECORDS) as usize);
+    let mut used = 8usize;
+    let mut out = Vec::new();
+    for d in pool {
+        let len = d.encode().len() + 2;
+        if used + len > MAX_MSG_BYTES {
+            break;
+        }
+        used += len;
+        out.push(d.clone());
+    }
+    out
+}
+
+/// Принимает ответ на `PeerHint` в хранилище клиента.
+pub fn absorb_hint_reply(
+    store: &mut DescriptorStore,
+    reply: Message,
+    now: u64,
+) -> Result<Stats, GossipError> {
+    let Message::HintReply(records) = reply else {
+        return Err(GossipError::Malformed("expected a hint reply"));
     };
     Ok(count(store, records, now))
 }

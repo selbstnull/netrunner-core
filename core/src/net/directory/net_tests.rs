@@ -204,3 +204,68 @@ async fn a_node_learns_a_peers_address_families_over_the_mesh_session() {
     assert!(!a.mesh.peer_supports(&b_id, Family::V6), "B said it has no IPv6");
     assert!(a.mesh.peer_supports(&b_id, Family::V4));
 }
+
+/// Клиент роя, подключённый к одному узлу, через `PeerHint` узнаёт остальные и может
+/// подключиться к любому из них с вычисленными учётными данными.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_learns_other_nodes_over_its_live_session_and_can_use_them() {
+    use crate::crypto::PeerIdentity;
+    use crate::net::ClientHandler;
+    use tokio::sync::mpsc;
+
+    let sw = SwarmKey::from_bytes([5u8; 32]);
+    let a = spawn(1, &sw).await;
+    let b = spawn(2, &sw).await;
+    let c = spawn(3, &sw).await;
+    seed(&a, &b);
+    seed(&a, &c);
+
+    async fn connect(addr: &str, secret: &str, public: &str) -> std::sync::Arc<crate::net::Muxer> {
+        let (tx_to_engine, rx_keep) = mpsc::channel(64);
+        let (tx_keep, rx_from_engine) = mpsc::channel(64);
+        std::mem::forget((rx_keep, tx_keep));
+        ClientHandler::connect(
+            addr,
+            "example.com",
+            None,
+            Some(Identity::Peer(PeerIdentity::from_hex(secret, public).unwrap())),
+            rx_from_engine,
+            tx_to_engine,
+        )
+        .await
+        .unwrap()
+    }
+    async fn wait_leg(m: &crate::net::Muxer) {
+        for _ in 0..100 {
+            if m.active_legs_count() >= 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("no leg came up");
+    }
+
+    // Клиент знает только A.
+    let own = a.dir.own(unix_now());
+    let tcp = own.endpoint(EndpointKind::Tcp).unwrap();
+    let a_addr = format!("{}:{}", tcp.host, tcp.port);
+    let muxer = connect(&a_addr, &sw.node_secret(&a.dir.node_id()), &hex::encode(own.static_pub)).await;
+    wait_leg(&muxer).await;
+
+    let cache = ClientDirectory::new(sw.clone(), true);
+    let stats = crate::net::directory::client::learn_nodes(&muxer, &cache, 16).await.expect("PeerHint answered");
+    assert_eq!(stats.learned(), 3, "A, B и C: {stats:?}");
+
+    let known: std::collections::HashSet<String> = [a_addr.clone()].into();
+    let learned = cache.nodes(unix_now(), &known);
+    assert_eq!(learned.len(), 2, "B и C: {learned:?}");
+
+    // к найденному узлу можно подключиться с вычисленными учётными данными
+    let n = &learned[0];
+    let m2 = connect(&n.address, &n.node_secret, &n.node_public_key).await;
+    wait_leg(&m2).await;
+
+    // повторный запрос ничего нового не приносит
+    let again = crate::net::directory::client::learn_nodes(&muxer, &cache, 16).await.unwrap();
+    assert_eq!(again.learned(), 0);
+}

@@ -14,6 +14,7 @@
 //!                   └─ validate_mesh_peer()  → допуск пира               (вместо /mesh/validate панели)
 //! ```
 
+pub mod client;
 pub mod descriptor;
 pub mod gossip;
 pub mod store;
@@ -32,6 +33,7 @@ pub use descriptor::{
     derive_node_id, features, host_is_public, node_id_hex, parse_node_id, DescriptorError,
     Endpoint, EndpointKind, NodeDescriptor, NodeId, Roles, MAX_VALIDITY_SECS,
 };
+pub use client::{ClientDirectory, LearnedNode};
 pub use gossip::{GossipError, Message, Stats};
 pub use store::{DescriptorStore, Insert, Reject, StoreConfig};
 pub use swarm::{SwarmIdentity, SwarmKey};
@@ -59,6 +61,8 @@ pub struct DirectoryConfig {
     /// Не чаще одного входящего обмена за столько секунд на весь узел.
     pub max_requests_per_window: u32,
     pub window_secs: u64,
+    /// Запросов `PeerHint` от клиентов за окно (отдельно от обмена между узлами).
+    pub max_hints_per_window: u32,
 }
 
 impl Default for DirectoryConfig {
@@ -72,6 +76,7 @@ impl Default for DirectoryConfig {
             validity_secs: 24 * 3600,
             max_requests_per_window: 60,
             window_secs: 10,
+            max_hints_per_window: 30,
         }
     }
 }
@@ -82,6 +87,8 @@ struct Inner {
     round: u64,
     window_start: u64,
     window_count: u32,
+    hint_window_start: u64,
+    hint_count: u32,
 }
 
 /// Каталог одного узла. Все методы принимают `now` (Unix, секунды), чтобы
@@ -142,6 +149,8 @@ impl Directory {
                 round: 0,
                 window_start: now,
                 window_count: 0,
+                hint_window_start: now,
+                hint_count: 0,
             }),
         }
     }
@@ -275,20 +284,37 @@ impl Directory {
         let msg = Message::decode(payload)?;
         let own = self.own(now);
         let mut g = self.inner.lock().unwrap();
-        if now.saturating_sub(g.window_start) >= self.cfg.window_secs {
-            g.window_start = now;
-            g.window_count = 0;
-        }
-        g.window_count += 1;
-        if g.window_count > self.cfg.max_requests_per_window {
-            return Err(DirectoryError::RateLimited);
+        // Обмен узлов и запросы клиентов считаются в разных окнах: наплыв клиентов
+        // не должен глушить gossip.
+        if matches!(msg, Message::Digest(_) | Message::Push(_)) {
+            if now.saturating_sub(g.window_start) >= self.cfg.window_secs {
+                g.window_start = now;
+                g.window_count = 0;
+            }
+            g.window_count += 1;
+            if g.window_count > self.cfg.max_requests_per_window {
+                return Err(DirectoryError::RateLimited);
+            }
         }
         match msg {
             Message::Digest(remote) => {
                 Ok(Handled::Reply(gossip::respond(&g.store, Some(&own), &remote, now).encode()))
             }
             Message::Push(_) => Ok(Handled::Absorbed(gossip::absorb(&mut g.store, msg, now)?)),
-            Message::Reply { .. } => Err(DirectoryError::UnexpectedMessage),
+            Message::HintRequest { max } => {
+                // Клиентам — отдельный бюджет: их наплыв не должен глушить обмен узлов.
+                if now.saturating_sub(g.hint_window_start) >= self.cfg.window_secs {
+                    g.hint_window_start = now;
+                    g.hint_count = 0;
+                }
+                g.hint_count += 1;
+                if g.hint_count > self.cfg.max_hints_per_window {
+                    return Err(DirectoryError::RateLimited);
+                }
+                let records = gossip::hint_records(&g.store, Some(&own), max, now);
+                Ok(Handled::Reply(Message::HintReply(records).encode()))
+            }
+            Message::Reply { .. } | Message::HintReply(_) => Err(DirectoryError::UnexpectedMessage),
         }
     }
 

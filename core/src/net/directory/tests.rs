@@ -579,3 +579,144 @@ async fn directory_validator_serves_peers_and_admission_without_a_panel() {
     assert!(v.validate_mesh_peer(&b.node_id_hex(), &sw.node_secret(&b.node_id())).await.is_ok());
     assert!(v.validate_mesh_peer(&b.node_id_hex(), "wrong").await.is_err());
 }
+
+// ───────────────────────────── PeerHint ────────────────────────────────────
+
+fn hint(d: &Directory, max: u8, now: u64) -> Result<Vec<NodeDescriptor>, DirectoryError> {
+    match d.handle_incoming(&Message::HintRequest { max }.encode(), now)? {
+        Handled::Reply(bytes) => match Message::decode(&bytes).unwrap() {
+            Message::HintReply(records) => Ok(records),
+            other => panic!("unexpected {other:?}"),
+        },
+        Handled::Absorbed(_) => panic!("a hint request has a reply"),
+    }
+}
+
+#[test]
+fn hint_messages_round_trip_and_clamp_the_request() {
+    let a = sample(1, "10.0.0.1");
+    for m in [Message::HintRequest { max: 7 }, Message::HintReply(vec![a.clone()]), Message::HintReply(vec![])] {
+        assert_eq!(Message::decode(&m.encode()).unwrap(), m);
+        assert_eq!(m.is_request(), matches!(m, Message::HintRequest { .. }));
+        assert_eq!(m.is_reply(), matches!(m, Message::HintReply(_)));
+    }
+    // завышенный запрос сжимается до предела
+    let wire = [4u8, 200];
+    assert_eq!(Message::decode(&wire).unwrap(), Message::HintRequest { max: gossip::MAX_HINT_RECORDS });
+    assert!(Message::decode(&[4u8]).is_err(), "обрезанный запрос");
+    assert!(Message::decode(&[4u8, 1, 9]).is_err(), "хвост");
+}
+
+#[test]
+fn a_hint_returns_random_relays_and_never_bridges() {
+    let sw = swarm();
+    let node = dir(1, "10.0.0.1", &sw);
+    let n = 12u8;
+    for i in 0..n {
+        node.insert(desc_with(10 + i, &format!("10.{}.0.1", 20 + i), 1, Roles::RELAY, T0, 3600), T0);
+    }
+    let bridge = desc_with(99, "10.99.0.1", 1, Roles::BRIDGE, T0, 3600);
+    assert_eq!(node.insert(bridge.clone(), T0), Insert::Added);
+
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..20 {
+        let r = hint(&node, 5, T0 + 1).unwrap();
+        assert!(r.len() <= 5 && !r.is_empty());
+        assert!(r.iter().all(|d| d.roles.has(Roles::RELAY)));
+        assert!(r.iter().all(|d| d.node_id != bridge.node_id), "мост клиенту не отдаётся");
+        seen.extend(r.into_iter().map(|d| d.node_id));
+    }
+    assert!(seen.len() > 5, "ответы разные у разных запросов, увидели {}", seen.len());
+    assert!(seen.contains(&node.node_id()) || seen.len() >= 6, "в пул входит и своя запись");
+    // max=0 — пустой ответ, а не ошибка
+    assert!(hint(&node, 0, T0 + 1).unwrap().is_empty());
+}
+
+#[test]
+fn client_hints_and_node_gossip_have_separate_rate_limits() {
+    let sw = swarm();
+    let d = dir_with(1, "10.0.0.1", &sw, |c| {
+        c.max_requests_per_window = 3;
+        c.max_hints_per_window = 2;
+        c.window_secs = 10;
+    });
+    let digest = Message::Digest(vec![]).encode();
+    // клиенты исчерпали свой бюджет…
+    assert!(hint(&d, 4, T0 + 1).is_ok() && hint(&d, 4, T0 + 1).is_ok());
+    assert!(matches!(hint(&d, 4, T0 + 1), Err(DirectoryError::RateLimited)));
+    // …но обмен между узлами это не задело
+    for _ in 0..3 {
+        assert!(d.handle_incoming(&digest, T0 + 1).is_ok());
+    }
+    assert!(matches!(d.handle_incoming(&digest, T0 + 1), Err(DirectoryError::RateLimited)));
+    // новое окно — снова можно обоим
+    assert!(hint(&d, 4, T0 + 30).is_ok());
+    assert!(d.handle_incoming(&digest, T0 + 30).is_ok());
+}
+
+#[test]
+fn the_client_cache_verifies_derives_credentials_and_persists() {
+    let sw = swarm();
+    let server = dir(1, "10.0.0.1", &sw);
+    for i in 0..4u8 {
+        server.insert(desc_with(30 + i, &format!("10.{}.0.1", 40 + i), 1, Roles::RELAY, T0, 3600), T0);
+    }
+    let client = ClientDirectory::new(sw.clone(), true);
+    assert!(client.is_empty());
+
+    let reply = {
+        let Ok(Handled::Reply(b)) = server.handle_incoming(&client.request(10), T0 + 1) else { panic!() };
+        b
+    };
+    let st = client.absorb_reply(&reply, T0 + 1).unwrap();
+    assert_eq!(st.learned(), 5, "четыре соседа и сам узел: {st:?}");
+
+    // учётные данные считаются клиентом сам, из ключа роя
+    let nodes = client.nodes(T0 + 1, &Default::default());
+    assert_eq!(nodes.len(), 5);
+    for n in &nodes {
+        let id = parse_node_id(&n.node_id).unwrap();
+        assert_eq!(n.node_secret, sw.node_secret(&id));
+        assert_eq!(n.node_public_key.len(), 64);
+        assert_eq!(n.proxy.to_string(), n.address);
+    }
+    // уже известные из конфига адреса исключаются
+    let known: std::collections::HashSet<String> = [nodes[0].address.clone()].into();
+    assert_eq!(client.nodes(T0 + 1, &known).len(), 4);
+
+    // подделка и мост в ответе не принимаются
+    let mut forged = desc_with(77, "10.77.0.1", 1, Roles::RELAY, T0, 3600);
+    forged.endpoints[0].host = "10.66.6.6".into();
+    let bridge = desc_with(78, "10.78.0.1", 1, Roles::BRIDGE, T0, 3600);
+    let bad = Message::HintReply(vec![forged, bridge]).encode();
+    let st = client.absorb_reply(&bad, T0 + 1).unwrap();
+    assert_eq!((st.learned(), st.rejected), (0, 2));
+    // и запрос вместо ответа — ошибка
+    assert!(client.absorb_reply(&client.request(1), T0 + 1).is_err());
+
+    // кэш переживает перезапуск, истёкшее отбрасывается
+    let snap = client.save(T0 + 1);
+    let again = ClientDirectory::new(sw.clone(), true);
+    assert_eq!(again.load(&snap, T0 + 1), 5);
+    assert_eq!(again.nodes(T0 + 200_000, &Default::default()).len(), 0);
+    // без ключа роя учётные данные чужие: клиент другого роя получает другие секреты
+    let other = ClientDirectory::new(SwarmKey::from_bytes([1u8; 32]), true);
+    other.load(&snap, T0 + 1);
+    assert_ne!(other.nodes(T0 + 1, &Default::default())[0].node_secret, nodes[0].node_secret);
+}
+
+#[test]
+fn only_ipv4_relays_become_client_candidates() {
+    let sw = swarm();
+    let client = ClientDirectory::new(sw, true);
+    let mk = |seed: u8, host: &str, roles: u8| desc_with(seed, host, 1, roles, T0, 3600);
+    let mut st = store();
+    for d in [mk(1, "10.1.0.1", Roles::RELAY), mk(2, "node.example.org", Roles::RELAY), mk(3, "2001:db8::1", Roles::RELAY), mk(4, "10.4.0.1", Roles::EXIT)] {
+        st.insert(d, T0);
+    }
+    let snap = st.export(T0);
+    client.load(&snap, T0);
+    let nodes = client.nodes(T0, &Default::default());
+    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    assert_eq!(nodes[0].address, "10.1.0.1:443");
+}

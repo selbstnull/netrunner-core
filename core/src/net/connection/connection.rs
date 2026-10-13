@@ -1828,6 +1828,7 @@ impl ClientHandler {
                 mesh_onion_peer: false,
                 reverse_egress: None,
                 egress_policy: Some(policy.clone()),
+                directory: None,
             })
         });
         let handler = Arc::new(StreamHandler::new(muxer.clone(), opener));
@@ -3192,6 +3193,7 @@ impl TunnelHandler for ServerHandler {
             .as_ref()
             .is_some_and(|route| route.remaining_hops > 1);
         let mesh_onion_peer = auth_token.starts_with("mesh4:");
+        let directory = mesh.as_ref().and_then(|mesh| mesh.directory());
         let opener = Arc::new(RemoteOpener {
             muxer: muxer.clone(),
             // A peer route keeps moving until its hop budget reaches the final
@@ -3215,6 +3217,7 @@ impl TunnelHandler for ServerHandler {
                 self.reverse_egress.clone()
             },
             egress_policy: None,
+            directory,
         });
         // A reverse-egress dialer never opens flows towards this ingress: no opener, so any
         // `Connect` it sends is rejected. The ingress opens streams towards it instead.

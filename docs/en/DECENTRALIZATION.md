@@ -189,7 +189,33 @@ session is **deliberately not done**: routes and the kill switch are bound to th
 all legs are dead for longer than `TUNNEL_DEAD_AFTER`, the engine exits by itself, the process ends with
 an error and the service manager (systemd/procd) restarts the client — now choosing the next live node.
 
-### 5.7 Number of legs
+### 5.7 The client learns nodes itself: `PeerHint`
+
+A swarm client (`swarm_key` set) asks the node it is connected to for a few neighbours about every 10
+minutes: a `PeerGossip` frame carrying `HintRequest{max ≤ 32}`, answered with `HintReply` — random live
+relay records (bridges are never handed out). Records go through the same checks as between nodes
+(signature, validity, per-network limit), land in the cache `<cache_dir>/directory.bin` (or
+`--directory-file`) and take part in the next start's node selection **after** the nodes from the
+config. The client computes a found node's credentials itself from the swarm key; without the key a
+received address is of no use to it.
+
+```toml
+remote_address = "203.0.113.10:443"
+node_secret = "…"
+node_public_key = "…"
+swarm_key = "<swarm key, 64 hex>"       # enables swarm mode and list refresh
+# directory_file = "/var/lib/netrunner/directory.bin"
+# learn_nodes = false                   # or --no-learn-nodes: cache and [[nodes]] only
+```
+
+Client requests are counted in a separate rate window (`max_hints_per_window`, 30 per 10 s) so a flood of
+clients cannot starve node-to-node exchange. **Compatibility:** a node without a directory silently drops
+the request, but a node of an older release drops the leg on the unknown frame — so the client sends
+`PeerHint` only when the operator explicitly enabled the swarm (`swarm_key`). Verified with real binaries:
+a client knew one node, learned the others, the primary node was stopped — the next start with the same
+config connected to a learned node.
+
+### 5.8 Number of legs
 
 In the same release the number of parallel TCP legs became a client setting: 1–10, default 4
 (`--tunnel-legs`, `tunnel_legs`, `SessionParams.tunnel_legs`, a setting in the app). The limit of 10 is
@@ -229,10 +255,21 @@ needs.
 * The digest is a window of ≤ 480 pairs; thousands of nodes need a compact digest (IBLT/Merkle).
 * Mesh-peer admission is "knows the swarm key", not "owns this node" (see 5.4).
 * Records carry public addresses; for host names publicness cannot be checked.
-* The client does not receive nodes from gossip automatically: the list in `client.toml` is set by hand
-  (`PeerHint` — stage C).
+* The client receives nodes through `PeerHint` (5.7), but only if it knows the `swarm_key`; that is the
+  network's shared secret (tokens replace it in stage B). Only nodes with an IPv4 address are used for now.
+* There is no node switch in the middle of a session: the node changes only by restarting the client.
 * Time: records rely on clocks; the allowed skew is 5 minutes.
 * Tests: the directory — format, admission rules, a 40-node network, attacks
   (`cargo test -p netrunner-core --lib -- directory`); four tests with real nodes over sockets (exchange,
   a foreign swarm key, bridges, an ordinary client); node selection in the client
   (`cargo test -p netrunner-client --features cli`).
+
+## 9. What is left in stage A
+
+* Gossip over connections the node dialled itself (behind NAT): today exchange goes only to nodes with a
+  public address. The base exists — reverse egress — but it needs `validate_egress` in the backend/swarm.
+* Mesh-peer admission by pairwise secrets from static DH and a challenge-response instead of the swarm key.
+* A compact digest (IBLT/Merkle) for directories of thousands of nodes.
+* `EXIT`/`BRIDGE` roles in routing (only `RELAY` is considered now).
+* Masking of node-to-node links (mesh-QUIC with the ALPN `nrxp-mesh/1` differs from a browser).
+* Switching nodes in the middle of a session.

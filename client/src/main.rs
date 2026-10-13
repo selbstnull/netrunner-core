@@ -62,6 +62,13 @@ struct FileConfig {
     strong_privacy: Option<bool>,
     tunnel_legs: Option<u32>,
     log_level: Option<String>,
+    /// Ключ роя (hex, 32 байта): клиент знает сеть узлов без панели и сам считает
+    /// учётные данные узлов, найденных через `PeerHint`. Не задан — как раньше.
+    swarm_key: Option<String>,
+    /// Где хранить найденные узлы (по умолчанию `<cache_dir>/directory.bin`).
+    directory_file: Option<PathBuf>,
+    /// Отключить пополнение списка узлов при заданном `swarm_key`.
+    learn_nodes: Option<bool>,
     /// Запасные узлы: `[[nodes]]` с `address`, `node_secret`, `node_public_key`, `sni`.
     /// При старте клиент подключается к первому достижимому (основной — первым).
     nodes: Vec<nodes::NodeEntry>,
@@ -150,6 +157,24 @@ struct Cli {
     #[arg(long, env = "NETRUNNER_TUNNEL_LEGS", value_parser = clap::value_parser!(u32).range(1..=10))]
     tunnel_legs: Option<u32>,
 
+    /// Ключ роя (hex, 64 символа). Включает режим роя: узлы из `[[nodes]]` и найденные
+    /// через `PeerHint` считаются узлами роя (старый узел без каталога порвёт ногу на
+    /// неизвестном кадре — включайте, только если узлы обновлены).
+    #[arg(long, env = "NETRUNNER_SWARM_KEY", hide_env_values = true)]
+    swarm_key: Option<String>,
+
+    /// Файл кэша найденных узлов.
+    #[arg(long, env = "NETRUNNER_DIRECTORY_FILE", value_name = "PATH")]
+    directory_file: Option<PathBuf>,
+
+    /// Не спрашивать у узла соседей (кэш и `[[nodes]]` работают как обычно).
+    #[arg(long)]
+    no_learn_nodes: bool,
+
+    /// Принимать узлы с частными адресами (LAN, стенды). В боевой сети не нужен.
+    #[arg(long)]
+    directory_allow_private: bool,
+
     #[arg(long, env = "RUST_LOG")]
     log_level: Option<String>,
 
@@ -190,6 +215,16 @@ struct EffectiveConfig {
     browser_profile: Option<PathBuf>,
     /// Запасные узлы из `[[nodes]]` (проверены при чтении конфига).
     fallback_nodes: Vec<nodes::NodeCandidate>,
+    /// Режим роя: ключ и путь к кэшу найденных узлов.
+    swarm: Option<SwarmSettings>,
+}
+
+struct SwarmSettings {
+    key: netrunner_core::net::directory::SwarmKey,
+    directory_file: PathBuf,
+    learn: bool,
+    /// Принимать частные адреса узлов (LAN, стенды).
+    allow_private: bool,
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -269,6 +304,26 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
         .map(|n| n.into_candidate(&default_sni))
         .collect::<Result<Vec<_>>>()?;
 
+    let cache_dir = cli
+        .cache_dir
+        .clone()
+        .or(file.cache_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("/tmp/netrunner"));
+    let swarm = match non_empty(cli.swarm_key.clone().or(file.swarm_key.clone())) {
+        Some(hex_key) => Some(SwarmSettings {
+            key: netrunner_core::net::directory::SwarmKey::from_hex(&hex_key)
+                .map_err(|e| anyhow::anyhow!("swarm_key: {e}"))?,
+            directory_file: cli
+                .directory_file
+                .clone()
+                .or(file.directory_file.clone())
+                .unwrap_or_else(|| cache_dir.join("directory.bin")),
+            learn: !cli.no_learn_nodes && file.learn_nodes.unwrap_or(true),
+            allow_private: cli.directory_allow_private,
+        }),
+        None => None,
+    };
+
     Ok(EffectiveConfig {
         remote_address,
         proxy_address,
@@ -296,14 +351,15 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
         log_level: non_empty(cli.log_level.or(file.log_level)).unwrap_or_else(|| "info".to_owned()),
         browser_profile: cli.browser_profile.or(file.browser_profile),
         fallback_nodes,
+        swarm,
     })
 }
 
 /// Выбирает рабочий узел из основного и запасных: прошлый рабочий — первым, затем по
 /// порядку конфига; берётся первый достижимый. Если живых нет, остаётся основной
 /// (ноги будут переподключаться, как и раньше).
-async fn select_node(config: &mut EffectiveConfig) {
-    if config.fallback_nodes.is_empty() {
+async fn select_node(config: &mut EffectiveConfig, learned: Vec<nodes::NodeCandidate>) {
+    if config.fallback_nodes.is_empty() && learned.is_empty() {
         return;
     }
     let primary = nodes::NodeCandidate {
@@ -315,6 +371,12 @@ async fn select_node(config: &mut EffectiveConfig) {
     };
     let mut all = vec![primary.clone()];
     all.extend(config.fallback_nodes.iter().cloned());
+    // Найденные через PeerHint — после настроенных вручную (адреса из конфига — выбор оператора).
+    for l in learned {
+        if !all.iter().any(|a| a.address == l.address) {
+            all.push(l);
+        }
+    }
     let ordered = nodes::order_candidates(all, nodes::read_last_good(&config.cache_dir).as_deref());
     match nodes::pick(&ordered, std::time::Duration::from_secs(3)).await {
         Some(i) => {
@@ -405,7 +467,32 @@ async fn main() -> Result<()> {
     }
 
     let mut config = config;
-    select_node(&mut config).await;
+    // Режим роя: кэш найденных узлов с прошлых запусков.
+    let node_cache = config.swarm.as_ref().map(|s| {
+        let dir = std::sync::Arc::new(netrunner_core::net::directory::ClientDirectory::new(
+            s.key.clone(),
+            s.allow_private,
+        ));
+        let now = netrunner_core::net::directory::unix_now();
+        if let Ok(bytes) = fs::read(&s.directory_file) {
+            let n = dir.load(&bytes, now);
+            info!(records = n, file = %s.directory_file.display(), "Загружен кэш узлов роя");
+        }
+        dir
+    });
+    let learned: Vec<nodes::NodeCandidate> = match &node_cache {
+        Some(dir) => {
+            let configured: std::collections::HashSet<String> = std::iter::once(config.remote_address.clone())
+                .chain(config.fallback_nodes.iter().map(|n| n.address.clone()))
+                .collect();
+            dir.nodes(netrunner_core::net::directory::unix_now(), &configured)
+                .into_iter()
+                .map(|n| nodes::NodeCandidate::from_learned(n, &config.sni))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    select_node(&mut config, learned).await;
 
     NetworkConfig::init_global(config.mtu);
     let tun_device = Tun::create(|tun_cfg| {
@@ -431,6 +518,14 @@ async fn main() -> Result<()> {
         .with_router_mode(config.router_mode, config.lan_interfaces)
         .with_strong_privacy(config.strong_privacy)
         .with_tunnel_legs(config.tunnel_legs);
+    let engine_config = match (config.swarm.as_ref(), node_cache) {
+        (Some(s), Some(dir)) if s.learn => engine_config.with_node_cache(net::engine::NodeCache {
+            dir,
+            path: Some(s.directory_file.clone()),
+            interval: std::time::Duration::from_secs(600),
+        }),
+        _ => engine_config,
+    };
 
     let build_result = EngineBuilder::new(engine_config)
         .with_tun(tun_device)
@@ -525,6 +620,36 @@ mod tests {
         let cli = Cli::try_parse_from(["netrunner-client", "--remote-address", "198.51.100.10:443"]).unwrap();
         assert!(build_config(cli, bad).is_err());
         assert!(toml::from_str::<FileConfig>("[[nodes]]\naddress = \"1.2.3.4:5\"\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn swarm_key_enables_the_swarm_mode_with_a_default_cache_file() {
+        let key = "ab".repeat(32);
+        let file: FileConfig = toml::from_str(&format!(
+            "remote_address = \"198.51.100.10:443\"\ncache_dir = \"/var/lib/nr\"\nswarm_key = \"{key}\"\n"
+        ))
+        .unwrap();
+        let cli = Cli::try_parse_from(["netrunner-client"]).unwrap();
+        let config = build_config(cli, file).unwrap();
+        let swarm = config.swarm.expect("swarm mode");
+        assert_eq!(swarm.directory_file, PathBuf::from("/var/lib/nr/directory.bin"));
+        assert!(swarm.learn && !swarm.allow_private);
+
+        // без ключа — как раньше
+        let cli = Cli::try_parse_from(["netrunner-client", "--remote-address", "198.51.100.10:443"]).unwrap();
+        assert!(build_config(cli, FileConfig::default()).unwrap().swarm.is_none());
+        // флаги: отключить пополнение, свой файл
+        let cli = Cli::try_parse_from([
+            "netrunner-client", "--remote-address", "198.51.100.10:443", "--swarm-key", &key,
+            "--no-learn-nodes", "--directory-file", "/x/dir.bin",
+        ])
+        .unwrap();
+        let swarm = build_config(cli, FileConfig::default()).unwrap().swarm.unwrap();
+        assert!(!swarm.learn);
+        assert_eq!(swarm.directory_file, PathBuf::from("/x/dir.bin"));
+        // испорченный ключ не молча игнорируется
+        let cli = Cli::try_parse_from(["netrunner-client", "--remote-address", "198.51.100.10:443", "--swarm-key", "zz"]).unwrap();
+        assert!(build_config(cli, FileConfig::default()).err().unwrap().to_string().contains("swarm_key"));
     }
 
     #[test]

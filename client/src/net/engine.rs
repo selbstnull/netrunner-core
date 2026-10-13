@@ -1070,6 +1070,18 @@ pub struct EngineConfig {
     pub mesh_route_preference: MeshRoutePreference,
     /// Сколько параллельных TCP-ног поднять; всегда в `1..=MAX_TUNNEL_LEGS`.
     pub tunnel_legs: u32,
+    /// Роевой клиент: кэш узлов, который пополняется через `PeerHint` по живой сессии.
+    pub directory: Option<NodeCache>,
+}
+
+/// Кэш найденных узлов и параметры его пополнения.
+#[derive(Clone)]
+pub struct NodeCache {
+    pub dir: Arc<netrunner_core::net::directory::ClientDirectory>,
+    /// Куда сохранять кэш при изменении.
+    pub path: Option<std::path::PathBuf>,
+    /// Как часто спрашивать у узла соседей.
+    pub interval: Duration,
 }
 
 impl EngineConfig {
@@ -1098,7 +1110,14 @@ impl EngineConfig {
             data_cipher_preference: DataCipherPreference::Auto,
             mesh_route_preference: MeshRoutePreference::ServerDefault,
             tunnel_legs: netrunner_core::net::DEFAULT_TUNNEL_LEGS,
+            directory: None,
         }
+    }
+
+    /// Включает пополнение списка узлов через `PeerHint` (режим роя).
+    pub fn with_node_cache(mut self, cache: NodeCache) -> Self {
+        self.directory = Some(cache);
+        self
     }
 
     /// Число параллельных TCP-ног туннеля. Приводится к `1..=10`; `0` — по умолчанию.
@@ -1387,6 +1406,16 @@ impl EngineBuilder {
         )
         .await
         .map_err(|e| format!("Failed to establish secure tunnel: {}", e))?;
+
+        // Роевой клиент: пока сессия жива, пополняем список узлов у того, к кому подключены.
+        if let Some(cache) = self.config.directory.clone() {
+            tokio::spawn(netrunner_core::net::directory::client::run_learning(
+                muxer.clone(),
+                cache.dir,
+                cache.path,
+                cache.interval,
+            ));
+        }
 
         let factory = self.socket_factory.unwrap_or_else(|| {
             let config_owned = (*NetworkConfig::global()).clone();

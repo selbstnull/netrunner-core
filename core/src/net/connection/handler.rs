@@ -53,6 +53,9 @@ pub struct RemoteOpener {
     pub reverse_egress: Option<Arc<super::ReverseEgressRegistry>>,
     /// Egress side of a reverse-egress session: what targets may be dialed.
     pub(crate) egress_policy: Option<Arc<super::reverse_egress::EgressRuntime>>,
+    /// Каталог узла (режим роя): отвечает клиентам на `PeerHint`. Есть у любой
+    /// сессии узла с каталогом — клиент к этому моменту уже прошёл хендшейк.
+    pub directory: Option<Arc<crate::net::directory::Directory>>,
 }
 
 impl RemoteOpener {
@@ -1819,18 +1822,24 @@ impl StreamHandler {
             metrics::counter!("netrunner_directory_bad_messages_total").increment(1);
             return;
         };
-        if !message.is_request() && !matches!(message, Message::Push(_)) {
-            // Reply на наш запрос.
+        if message.is_reply() {
+            // Ответ на наш запрос (обмен узлов или PeerHint).
             self.muxer.dispatch_to_local(stream_id, payload);
             return;
         }
-        let Some(directory) = self
-            .opener
-            .as_ref()
-            .filter(|opener| opener.mesh_peer)
-            .and_then(|opener| opener.mesh.as_ref())
-            .and_then(|mesh| mesh.directory())
-        else {
+        let Some(opener) = self.opener.as_ref() else {
+            return;
+        };
+        let directory = match message {
+            // Клиент узла спрашивает соседей: обслуживается любая прошедшая хендшейк сессия.
+            Message::HintRequest { .. } => opener.directory.clone(),
+            // Обмен записями — только между аутентифицированными mesh-пирами.
+            _ => opener
+                .mesh_peer
+                .then(|| opener.mesh.as_ref().and_then(|mesh| mesh.directory()))
+                .flatten(),
+        };
+        let Some(directory) = directory else {
             return;
         };
         match directory.handle_incoming(&payload, crate::net::directory::unix_now()) {

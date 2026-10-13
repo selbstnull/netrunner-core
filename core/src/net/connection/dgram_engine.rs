@@ -1233,6 +1233,7 @@ async fn process_datagram(
             mesh_onion_peer: false,
             reverse_egress: None,
             egress_policy: None,
+            directory: None,
         });
         let handler = Arc::new(StreamHandler::new(entry.muxer.clone(), Some(opener)));
 
@@ -1975,6 +1976,7 @@ mod tests {
             mesh_onion_peer: false,
             reverse_egress: None,
             egress_policy: None,
+            directory: None,
         });
         let handler = StreamHandler::new(muxer.clone(), Some(opener));
 

@@ -69,6 +69,19 @@ impl NodeEntry {
     }
 }
 
+impl NodeCandidate {
+    /// Узел, найденный через `PeerHint`: учётные данные вычислены из ключа роя.
+    pub fn from_learned(n: netrunner_core::net::directory::LearnedNode, default_sni: &str) -> Self {
+        Self {
+            address: n.address,
+            proxy: n.proxy,
+            sni: if n.sni.is_empty() { default_sni.to_owned() } else { n.sni },
+            node_secret: Some(n.node_secret),
+            node_public_key: Some(n.node_public_key),
+        }
+    }
+}
+
 /// Порядок попыток: прошлый рабочий узел (если он в списке) первым, остальные — как
 /// в конфиге (основной — раньше запасных).
 pub fn order_candidates(mut all: Vec<NodeCandidate>, last_good: Option<&str>) -> Vec<NodeCandidate> {
@@ -151,6 +164,26 @@ mod tests {
         assert_eq!(first_reachable(&[true, true]), Some(0));
         assert_eq!(first_reachable(&[false, false]), None);
         assert_eq!(first_reachable(&[]), None);
+    }
+
+    #[test]
+    fn learned_nodes_carry_derived_credentials_and_fall_back_to_the_default_sni() {
+        use netrunner_core::net::directory::LearnedNode;
+        let n = LearnedNode {
+            node_id: "00".repeat(16),
+            address: "198.51.100.5:443".into(),
+            proxy: "198.51.100.5:443".parse().unwrap(),
+            sni: String::new(),
+            node_secret: "11".repeat(32),
+            node_public_key: "22".repeat(32),
+            valid_until: 1,
+        };
+        let c = NodeCandidate::from_learned(n.clone(), "www.default.example");
+        assert_eq!(c.sni, "www.default.example");
+        assert_eq!(c.node_secret.as_deref(), Some(n.node_secret.as_str()));
+        assert_eq!(c.node_public_key.as_deref(), Some(n.node_public_key.as_str()));
+        let with_sni = NodeCandidate::from_learned(LearnedNode { sni: "cdn.example".into(), ..n }, "x");
+        assert_eq!(with_sni.sni, "cdn.example");
     }
 
     #[test]
