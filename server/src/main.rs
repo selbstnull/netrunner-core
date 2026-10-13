@@ -193,6 +193,29 @@ struct Args {
     #[arg(long, default_value_t = 7)]
     endorse_days: u64,
 
+    /// Напечатать приглашение к подключению этого узла и выйти:
+    /// `nrxp://host:port?pk=…&secret=…&token=…&sni=…&name=…`. Адрес — `--advertise`
+    /// (или `--invite-addr`), ключи — из `PROXY_NRXP_PRIVATE_KEY` / `PROXY_NRXP_SECRET`
+    /// (в рое секрет выводится из `--swarm-key`). **Приглашение — секрет**: передавайте
+    /// по закрытому каналу.
+    #[arg(long)]
+    invite: bool,
+    /// Имя приглашения для списка в приложении (например, «мой телефон»).
+    #[arg(long, requires = "invite")]
+    invite_name: Option<String>,
+    /// Bearer-токен клиента для узлов с `--require-auth`.
+    #[arg(long, env = "NETRUNNER_INVITE_TOKEN", hide_env_values = true, requires = "invite")]
+    invite_token: Option<String>,
+    /// Домен-декой в приглашении (по умолчанию `--decoy-host`).
+    #[arg(long, requires = "invite")]
+    invite_sni: Option<String>,
+    /// Публичный адрес `host:port` в приглашении (по умолчанию `--advertise`).
+    #[arg(long, requires = "invite")]
+    invite_addr: Option<String>,
+    /// Формат вывода: `uri` — одна строка `nrxp://…`, `toml` — блок для `client.toml`.
+    #[arg(long, default_value = "uri", value_parser = ["uri", "toml"], requires = "invite")]
+    invite_format: String,
+
     /// Требовать валидный Bearer-токен (выданный `netrunner-backend`) от
     /// каждого клиента и отчитываться о расходе трафика для динамических
     /// лимитов. Выключено по умолчанию — включается по инстансу, не меняя
@@ -247,9 +270,14 @@ fn main() {
     // инцидентов на proxy-fr1). JSON уходит в stdout — виден через
     // `docker logs`, централизованный сбор состояния тоннеля идёт отдельным
     // push-каналом на control-plane (см. `report_node_health` в network.rs).
+    let args = Args::parse();
+    // Приглашение печатается без логгера: в stdout только строка, которую забирает скрипт.
+    if args.invite {
+        invite_tool(&args);
+        return;
+    }
     Logger::init(None, true);
     Logger::global().set_level("info");
-    let args = Args::parse();
 
     if !(1..=netrunner_core::net::MAX_MESH_HOPS).contains(&args.mesh_max_hops) {
         panic!(
@@ -729,6 +757,54 @@ pub(crate) fn load_endorsements(sources: &[String]) -> Vec<netrunner_core::net::
         }
     }
     out
+}
+
+/// `--invite`: печатает приглашение `nrxp://…` (или блок `client.toml`) для этого узла.
+/// Результат — только в stdout; пояснения — в stderr, чтобы вывод можно было забрать
+/// подстановкой команды. Ошибки — понятное сообщение и код 2.
+fn invite_tool(args: &Args) {
+    use netrunner_core::invite::Invite;
+    use netrunner_core::net::directory::{SwarmIdentity, SwarmKey};
+    let fail = |msg: String| -> ! {
+        eprintln!("--invite: {msg}");
+        std::process::exit(2)
+    };
+    let private = std::env::var("PROXY_NRXP_PRIVATE_KEY")
+        .unwrap_or_else(|_| fail("нужен PROXY_NRXP_PRIVATE_KEY (статический ключ узла, hex)".into()));
+    let identity = SwarmIdentity::from_private_hex(&private).unwrap_or_else(|e| fail(format!("PROXY_NRXP_PRIVATE_KEY: {e}")));
+    let public_key = hex::encode(identity.static_pub);
+    // В рое входной секрет выводится из ключа роя, иначе задаётся явно.
+    let secret = match args.swarm_key.as_deref() {
+        Some(key) => {
+            let derived = SwarmKey::from_hex(key)
+                .unwrap_or_else(|e| fail(format!("--swarm-key: {e}")))
+                .node_secret(&identity.node_id);
+            if let Ok(explicit) = std::env::var("PROXY_NRXP_SECRET") {
+                if !explicit.trim().eq_ignore_ascii_case(&derived) {
+                    fail("PROXY_NRXP_SECRET не совпадает с секретом, выведенным из --swarm-key".into());
+                }
+            }
+            derived
+        }
+        None => std::env::var("PROXY_NRXP_SECRET")
+            .unwrap_or_else(|_| fail("нужен PROXY_NRXP_SECRET (или --swarm-key)".into())),
+    };
+    let addr = args
+        .invite_addr
+        .as_deref()
+        .or(args.advertise.as_deref())
+        .unwrap_or_else(|| fail("укажите публичный адрес: --advertise или --invite-addr host:port".into()));
+    let sni = args.invite_sni.as_deref().unwrap_or(&args.decoy_host);
+    let invite = Invite::new(addr, &public_key, &secret, args.invite_token.as_deref(), Some(sni), args.invite_name.as_deref())
+        .unwrap_or_else(|e| fail(e.to_string()));
+    if args.require_auth && invite.token.is_none() {
+        eprintln!("--invite: предупреждение: узел с --require-auth, а токен не задан (--invite-token)");
+    }
+    match args.invite_format.as_str() {
+        "toml" => print!("{}", invite.to_toml()),
+        _ => println!("{}", invite.to_uri()),
+    }
+    eprintln!("Приглашение содержит секрет узла — передавайте только по закрытому каналу.");
 }
 
 /// `--authority-keygen` и `--authority-endorse`: инструмент авторитета.

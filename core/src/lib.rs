@@ -167,6 +167,8 @@ pub mod devtools;
 /// Браузерные профили как данные: загрузка из JSON, проверка, подмена
 /// встроенных профилей своими.
 pub mod browser_profile;
+/// Приглашение к подключению `nrxp://…`: сборка и разбор одной строки.
+pub mod invite;
 
 pub mod decoy {
     pub use crate::tlseng::decoy::{

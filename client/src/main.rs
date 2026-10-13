@@ -45,6 +45,9 @@ impl From<TunnelModeArg> for TunnelMode {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
+    /// Приглашение `nrxp://…` (его печатает `netrunner-proxy-server --invite`): вместо
+    /// отдельных remote_address / sni / auth_token / node_secret / node_public_key.
+    invite: Option<String>,
     remote_address: Option<String>,
     sni: Option<String>,
     auth_token: Option<String>,
@@ -95,6 +98,12 @@ struct Cli {
     /// TOML-конфиг (для OpenWrt: /etc/netrunner/client.toml).
     #[arg(long, env = "NETRUNNER_CONFIG", value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Приглашение `nrxp://адрес?pk=…&secret=…&token=…&sni=…&name=…` вместо отдельных
+    /// адреса, SNI, токена и ключей узла. Явно заданные `--remote-address` и др. важнее.
+    /// Содержит секрет: в `ps` видно — лучше `NETRUNNER_INVITE` или поле `invite` в TOML.
+    #[arg(long, env = "NETRUNNER_INVITE", hide_env_values = true)]
+    invite: Option<String>,
 
     /// IPv4-адрес VPN-ноды с портом, например 203.0.113.10:443.
     #[arg(long, env = "NETRUNNER_REMOTE_ADDRESS")]
@@ -272,7 +281,46 @@ fn read_file_config(path: Option<&PathBuf>) -> Result<FileConfig> {
     toml::from_str(&raw).with_context(|| format!("невалидный TOML в конфиге {}", path.display()))
 }
 
-fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
+/// Раскладывает приглашение по полям подключения. Явные `--remote-address`, `--sni`,
+/// `--auth-token`, `--node-secret`, `--node-public-key` важнее приглашения; приглашение
+/// из командной строки или окружения важнее одноимённых полей TOML. Приглашение в TOML
+/// не сочетается с этими же полями там же — это почти наверняка ошибка.
+fn apply_invite(cli: &mut Cli, file: &mut FileConfig) -> Result<()> {
+    let from_cli = cli.invite.is_some();
+    let Some(raw) = non_empty(cli.invite.take().or_else(|| file.invite.take())) else {
+        return Ok(());
+    };
+    let invite = netrunner_core::invite::Invite::parse(&raw)
+        .map_err(|e| anyhow::anyhow!("невалидное приглашение: {e}"))?;
+    if !from_cli
+        && (file.remote_address.is_some() || file.node_secret.is_some() || file.node_public_key.is_some())
+    {
+        bail!("в TOML задано и invite, и remote_address/node_secret/node_public_key — оставьте что-то одно");
+    }
+    if let Some(name) = &invite.name {
+        eprintln!("Приглашение «{name}»");
+    }
+    if from_cli {
+        file.remote_address = None;
+        file.sni = None;
+        file.auth_token = None;
+        file.node_secret = None;
+        file.node_public_key = None;
+    }
+    cli.remote_address.get_or_insert(invite.addr);
+    cli.node_secret.get_or_insert(invite.secret);
+    cli.node_public_key.get_or_insert(invite.public_key);
+    if let Some(sni) = invite.sni {
+        cli.sni.get_or_insert(sni);
+    }
+    if let Some(token) = invite.token {
+        cli.auth_token.get_or_insert(token);
+    }
+    Ok(())
+}
+
+fn build_config(mut cli: Cli, mut file: FileConfig) -> Result<EffectiveConfig> {
+    apply_invite(&mut cli, &mut file)?;
     let remote_address = non_empty(cli.remote_address.or(file.remote_address))
         .context("укажите remote_address в TOML или --remote-address")?;
     let proxy_address: SocketAddr = remote_address
@@ -611,6 +659,52 @@ mod tests {
         assert_eq!(config.mtu, 1380);
         assert!(!config.killswitch_enabled);
         assert_eq!(config.lan_interfaces, ["br-lan"]);
+    }
+
+    fn invite() -> String {
+        format!(
+            "nrxp://198.51.100.20:8443?pk={}&secret={}&token=tok&sni=www.debian.org&name=%D0%BC%D0%BE%D0%B9+%D1%82%D0%B5%D0%BB%D0%B5%D1%84%D0%BE%D0%BD",
+            "ab".repeat(32),
+            "cd".repeat(32)
+        )
+    }
+
+    #[test]
+    fn invite_fills_the_connection_fields_and_explicit_flags_win() {
+        let cli = Cli::try_parse_from(["netrunner-client", "--invite", &invite()]).unwrap();
+        let config = build_config(cli, FileConfig::default()).unwrap();
+        assert_eq!(config.remote_address, "198.51.100.20:8443");
+        assert_eq!(config.sni, "www.debian.org");
+        assert_eq!(config.auth_token.as_deref(), Some("tok"));
+        assert_eq!(config.node_secret.as_deref(), Some(&"cd".repeat(32)[..]));
+        assert_eq!(config.node_public_key.as_deref(), Some(&"ab".repeat(32)[..]));
+
+        // Приглашение из командной строки важнее полей TOML, явный флаг — важнее приглашения.
+        let cli = Cli::try_parse_from(["netrunner-client", "--invite", &invite(), "--sni", "cdn.example"]).unwrap();
+        let file = FileConfig {
+            remote_address: Some("203.0.113.10:443".into()),
+            auth_token: Some("old".into()),
+            ..FileConfig::default()
+        };
+        let config = build_config(cli, file).unwrap();
+        assert_eq!((config.remote_address.as_str(), config.sni.as_str()), ("198.51.100.20:8443", "cdn.example"));
+        assert_eq!(config.auth_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn invite_in_toml_works_alone_and_conflicts_with_manual_fields() {
+        let file: FileConfig = toml::from_str(&format!("invite = \"{}\"\ntunnel_legs = 3\n", invite())).unwrap();
+        let config = build_config(Cli::try_parse_from(["netrunner-client"]).unwrap(), file).unwrap();
+        assert_eq!(config.remote_address, "198.51.100.20:8443");
+        assert_eq!(config.tunnel_legs, 3);
+
+        let both: FileConfig =
+            toml::from_str(&format!("invite = \"{}\"\nremote_address = \"203.0.113.10:443\"\n", invite())).unwrap();
+        assert!(build_config(Cli::try_parse_from(["netrunner-client"]).unwrap(), both).is_err());
+
+        let bad = Cli::try_parse_from(["netrunner-client", "--invite", "nrxp://198.51.100.20:8443?pk=zz"]).unwrap();
+        let err = build_config(bad, FileConfig::default()).err().unwrap().to_string();
+        assert!(err.contains("приглашение"), "{err}");
     }
 
     #[test]
