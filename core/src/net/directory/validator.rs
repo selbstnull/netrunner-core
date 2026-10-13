@@ -71,11 +71,36 @@ impl AuthValidator for DirectoryValidator {
         }
     }
 
+    /// Гибрид: пиры панели (если она есть и отвечает) плюс пиры каталога. При совпадении
+    /// адреса или идентификатора побеждает панель — это решение центра. Недоступная
+    /// панель не отключает каталог.
     async fn list_mesh_peers(&self) -> Result<Vec<MeshPeer>, AppError> {
-        Ok(self.directory.peers(unix_now()))
+        let mut out: Vec<MeshPeer> = match &self.inner {
+            Some(panel) => panel.list_mesh_peers().await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut seen_addr: std::collections::HashSet<String> =
+            out.iter().map(|p| p.address().to_ascii_lowercase()).collect();
+        let mut seen_id: std::collections::HashSet<String> =
+            out.iter().map(|p| p.node_id.to_ascii_lowercase()).collect();
+        for p in self.directory.peers(unix_now()) {
+            if seen_addr.insert(p.address().to_ascii_lowercase())
+                && seen_id.insert(p.node_id.to_ascii_lowercase())
+            {
+                out.push(p);
+            }
+        }
+        Ok(out)
     }
 
+    /// Гибрид: пир проходит, если его подтверждает панель **или** он член роя
+    /// (и, в управляемой сети, поручен авторитетом).
     async fn validate_mesh_peer(&self, peer_id: &str, peer_secret: &str) -> Result<(), AppError> {
+        if let Some(panel) = &self.inner {
+            if panel.validate_mesh_peer(peer_id, peer_secret).await.is_ok() {
+                return Ok(());
+            }
+        }
         if self.directory.validate_mesh_peer(peer_id, peer_secret) {
             Ok(())
         } else {

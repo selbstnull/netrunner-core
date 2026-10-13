@@ -99,3 +99,35 @@ impl SwarmIdentity {
         node_id_hex(&self.node_id)
     }
 }
+
+/// Парный секрет двух узлов из статического DH: `HKDF(X25519(мой, чужой))`, симметричен.
+/// Его знают только эти двое — в отличие от ключа роя, который знает любой участник.
+pub fn pairwise_secret(my_private: &[u8; 32], their_public: &[u8; 32]) -> [u8; 32] {
+    let shared = StaticSecret::from(*my_private).diffie_hellman(&PublicKey::from(*their_public));
+    let my_pub = *PublicKey::from(&StaticSecret::from(*my_private)).as_bytes();
+    let (lo, hi) = if my_pub <= *their_public { (my_pub, *their_public) } else { (*their_public, my_pub) };
+    let hk = Hkdf::<Sha256>::new(Some(b"nrxp-pair-v1"), shared.as_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(&[lo.as_slice(), hi.as_slice()].concat(), &mut out)
+        .expect("32 bytes is a valid HKDF output length");
+    out
+}
+
+/// Доказательство для mesh-токена: производная парного секрета, hex. Подслушавший
+/// токен у одного адресата не может предъявить его другому: у каждой пары свой секрет.
+///
+/// 128 бит (32 hex): целиком токен `<секрет роя 64>.<доказательство 32>` укладывается
+/// в предел 128 символов поля секрета (`valid_mesh_peer_secret`), а подбор онлайн
+/// 2^128 не осилить.
+pub fn pair_proof(pair_secret: &[u8; 32]) -> String {
+    let hk = Hkdf::<Sha256>::new(Some(b"nrxp-pair-v1"), pair_secret);
+    let mut out = [0u8; 16];
+    hk.expand(b"mesh-admit", &mut out).expect("16 bytes is a valid HKDF output length");
+    hex::encode(out)
+}
+
+/// Сравнение строк в постоянное время.
+pub fn ct_eq_str(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}

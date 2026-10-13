@@ -69,6 +69,9 @@ struct FileConfig {
     directory_file: Option<PathBuf>,
     /// Отключить пополнение списка узлов при заданном `swarm_key`.
     learn_nodes: Option<bool>,
+    /// Ключи авторитетов управляемой сети (hex, Ed25519): клиент принимает из
+    /// `PeerHint` только записи с поручительством одного из них.
+    trust_anchors: Vec<String>,
     /// Запасные узлы: `[[nodes]]` с `address`, `node_secret`, `node_public_key`, `sni`.
     /// При старте клиент подключается к первому достижимому (основной — первым).
     nodes: Vec<nodes::NodeEntry>,
@@ -163,6 +166,10 @@ struct Cli {
     #[arg(long, env = "NETRUNNER_SWARM_KEY", hide_env_values = true)]
     swarm_key: Option<String>,
 
+    /// Ключ авторитета (hex, Ed25519). Можно несколько (повторять флаг или через запятую).
+    #[arg(long = "trust-anchor", env = "NETRUNNER_TRUST_ANCHOR", value_delimiter = ',')]
+    trust_anchor: Vec<String>,
+
     /// Файл кэша найденных узлов.
     #[arg(long, env = "NETRUNNER_DIRECTORY_FILE", value_name = "PATH")]
     directory_file: Option<PathBuf>,
@@ -225,6 +232,19 @@ struct SwarmSettings {
     learn: bool,
     /// Принимать частные адреса узлов (LAN, стенды).
     allow_private: bool,
+    trust_anchors: Vec<[u8; 32]>,
+}
+
+fn parse_trust_anchors(list: &[String]) -> Result<Vec<[u8; 32]>> {
+    list.iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            hex::decode(s.trim())
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or_else(|| anyhow::anyhow!("trust_anchor: ожидается 32 байта в hex, получено {s:?}"))
+        })
+        .collect()
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -320,6 +340,7 @@ fn build_config(cli: Cli, file: FileConfig) -> Result<EffectiveConfig> {
                 .unwrap_or_else(|| cache_dir.join("directory.bin")),
             learn: !cli.no_learn_nodes && file.learn_nodes.unwrap_or(true),
             allow_private: cli.directory_allow_private,
+            trust_anchors: parse_trust_anchors(if cli.trust_anchor.is_empty() { &file.trust_anchors } else { &cli.trust_anchor })?,
         }),
         None => None,
     };
@@ -472,6 +493,7 @@ async fn main() -> Result<()> {
         let dir = std::sync::Arc::new(netrunner_core::net::directory::ClientDirectory::new(
             s.key.clone(),
             s.allow_private,
+            s.trust_anchors.clone(),
         ));
         let now = netrunner_core::net::directory::unix_now();
         if let Ok(bytes) = fs::read(&s.directory_file) {

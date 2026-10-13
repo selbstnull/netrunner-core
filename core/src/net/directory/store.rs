@@ -27,6 +27,10 @@ pub struct StoreConfig {
     pub max_per_prefix: usize,
     /// Разрешить частные адреса (LAN, тесты). В боевой сети — `false`.
     pub allow_private: bool,
+    /// Ключи авторитетов. Пусто — открытая сеть (рой): принимается любая запись с
+    /// верной подписью. Не пусто — управляемая: нужна запись с действующим
+    /// поручительством одного из этих ключей, и она живёт не дольше поручительства.
+    pub trust_anchors: Vec<[u8; 32]>,
 }
 
 impl Default for StoreConfig {
@@ -35,6 +39,7 @@ impl Default for StoreConfig {
             max_records: 2048,
             max_per_prefix: 3,
             allow_private: false,
+            trust_anchors: Vec::new(),
         }
     }
 }
@@ -44,6 +49,8 @@ pub enum Reject {
     Invalid(DescriptorError),
     /// Слишком много узлов из одной сети.
     PrefixLimit,
+    /// Сеть управляется авторитетом, а у записи нет действующего поручительства.
+    NotEndorsed,
     /// Хранилище заполнено более долгоживущими записями.
     Full,
 }
@@ -61,6 +68,8 @@ pub struct DescriptorStore {
     cfg: StoreConfig,
     self_id: Option<NodeId>,
     map: HashMap<NodeId, NodeDescriptor>,
+    /// До какого времени поручена каждая запись (только при `trust_anchors`).
+    endorsed_until: HashMap<NodeId, u64>,
 }
 
 fn prefix_of(d: &NodeDescriptor) -> String {
@@ -73,6 +82,7 @@ impl DescriptorStore {
             cfg,
             self_id,
             map: HashMap::new(),
+            endorsed_until: HashMap::new(),
         }
     }
 
@@ -100,6 +110,14 @@ impl DescriptorStore {
         if self.self_id == Some(d.node_id) {
             return Insert::Stale; // о себе мы знаем лучше всех
         }
+        let endorsed = if self.cfg.trust_anchors.is_empty() {
+            None
+        } else {
+            match d.endorsed_until(&self.cfg.trust_anchors).filter(|until| *until > now) {
+                Some(until) => Some(until),
+                None => return Insert::Rejected(Reject::NotEndorsed),
+            }
+        };
         let existing_seq = self.map.get(&d.node_id).map(|o| o.seq);
         if existing_seq.is_some_and(|s| d.seq <= s) {
             return Insert::Stale;
@@ -131,6 +149,14 @@ impl DescriptorStore {
         }
 
         let outcome = if existing_seq.is_some() { Insert::Updated } else { Insert::Added };
+        match endorsed {
+            Some(until) => {
+                self.endorsed_until.insert(d.node_id, until);
+            }
+            None => {
+                self.endorsed_until.remove(&d.node_id);
+            }
+        }
         self.map.insert(d.node_id, d);
         outcome
     }
@@ -139,12 +165,34 @@ impl DescriptorStore {
     pub fn gc(&mut self, now: u64) -> usize {
         let before = self.map.len();
         self.map.retain(|_, d| d.valid_until > now);
+        // Узел с истёкшим поручительством в управляемой сети больше не узел.
+        if !self.cfg.trust_anchors.is_empty() {
+            let dead: Vec<NodeId> = self
+                .endorsed_until
+                .iter()
+                .filter(|(_, until)| **until <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in dead {
+                self.map.remove(&id);
+            }
+        }
+        self.endorsed_until.retain(|id, _| self.map.contains_key(id));
         before - self.map.len()
     }
 
     /// Живые записи.
     pub fn live(&self, now: u64) -> impl Iterator<Item = &NodeDescriptor> {
-        self.map.values().filter(move |d| d.valid_until > now)
+        let managed = !self.cfg.trust_anchors.is_empty();
+        self.map.values().filter(move |d| {
+            d.valid_until > now
+                && (!managed || self.endorsed_until.get(&d.node_id).is_some_and(|u| *u > now))
+        })
+    }
+
+    /// Запись о конкретном узле, если она жива (в управляемой сети — и поручена).
+    pub fn live_get(&self, id: &NodeId, now: u64) -> Option<&NodeDescriptor> {
+        self.live(now).find(|d| d.node_id == *id)
     }
 
     /// Пары `(node_id, seq)` для обмена. Адреса мостов не пересказываются. Если

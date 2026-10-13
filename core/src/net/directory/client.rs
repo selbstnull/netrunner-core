@@ -44,12 +44,15 @@ pub struct ClientDirectory {
 }
 
 impl ClientDirectory {
-    pub fn new(swarm: SwarmKey, allow_private: bool) -> Self {
+    /// `trust_anchors` — ключи авторитетов управляемой сети (пусто — открытая сеть):
+    /// клиент принимает только записи с действующим поручительством.
+    pub fn new(swarm: SwarmKey, allow_private: bool, trust_anchors: Vec<[u8; 32]>) -> Self {
         Self {
             swarm,
             store: Mutex::new(DescriptorStore::new(
                 StoreConfig {
                     allow_private,
+                    trust_anchors,
                     // Клиенту хватает небольшого запаса адресов.
                     max_records: 256,
                     ..Default::default()

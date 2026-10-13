@@ -30,13 +30,13 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use descriptor::{
-    derive_node_id, features, host_is_public, node_id_hex, parse_node_id, DescriptorError,
+    derive_node_id, Endorsement, features, host_is_public, node_id_hex, parse_node_id, DescriptorError,
     Endpoint, EndpointKind, NodeDescriptor, NodeId, Roles, MAX_VALIDITY_SECS,
 };
 pub use client::{ClientDirectory, LearnedNode};
 pub use gossip::{GossipError, Message, Stats};
 pub use store::{DescriptorStore, Insert, Reject, StoreConfig};
-pub use swarm::{SwarmIdentity, SwarmKey};
+pub use swarm::{ct_eq_str, pair_proof, pairwise_secret, SwarmIdentity, SwarmKey};
 pub use validator::DirectoryValidator;
 
 use super::auth::MeshPeer;
@@ -56,6 +56,12 @@ pub struct DirectoryConfig {
     pub roles: u8,
     /// Диапазон принимаемых версий NRXP.
     pub proto: (u8, u8),
+    /// Поручительства авторитетов за этот узел (управляемая сеть).
+    pub endorsements: Vec<Endorsement>,
+    /// Строгий допуск: о ком в каталоге уже есть запись, тот обязан предъявить парное
+    /// доказательство (иначе любой член роя мог бы выдать себя за него). Выключено по
+    /// умолчанию ради совместимости с узлами, не знающими `PAIRWISE`.
+    pub strict_pairwise: bool,
     /// Срок жизни своей записи.
     pub validity_secs: u64,
     /// Не чаще одного входящего обмена за столько секунд на весь узел.
@@ -73,6 +79,8 @@ impl Default for DirectoryConfig {
             decoy_sni: String::new(),
             roles: Roles::RELAY,
             proto: (2, 6),
+            endorsements: Vec::new(),
+            strict_pairwise: false,
             validity_secs: 24 * 3600,
             max_requests_per_window: 60,
             window_secs: 10,
@@ -84,6 +92,8 @@ impl Default for DirectoryConfig {
 struct Inner {
     store: DescriptorStore,
     own: NodeDescriptor,
+    /// Действующие поручительства: подмешиваются в каждую перевыпущенную запись.
+    endorsements: Vec<Endorsement>,
     round: u64,
     window_start: u64,
     window_count: u32,
@@ -138,7 +148,8 @@ impl From<GossipError> for DirectoryError {
 impl Directory {
     pub fn new(identity: SwarmIdentity, swarm: SwarmKey, cfg: DirectoryConfig, now: u64) -> Self {
         let store = DescriptorStore::new(cfg.store.clone(), Some(identity.node_id));
-        let own = Self::sign_own(&identity, &cfg, now, now);
+        let endorsements = cfg.endorsements.clone();
+        let own = Self::sign_own(&identity, &cfg, &endorsements, now, now);
         Self {
             identity,
             swarm,
@@ -146,6 +157,7 @@ impl Directory {
             inner: Mutex::new(Inner {
                 store,
                 own,
+                endorsements,
                 round: 0,
                 window_start: now,
                 window_count: 0,
@@ -155,19 +167,49 @@ impl Directory {
         }
     }
 
-    fn sign_own(identity: &SwarmIdentity, cfg: &DirectoryConfig, seq: u64, now: u64) -> NodeDescriptor {
-        NodeDescriptor::sign(
+    fn sign_own(
+        identity: &SwarmIdentity,
+        cfg: &DirectoryConfig,
+        endorsements: &[Endorsement],
+        seq: u64,
+        now: u64,
+    ) -> NodeDescriptor {
+        NodeDescriptor::sign_endorsed(
             &identity.signing,
             identity.static_pub,
             Roles(cfg.roles),
-            features::GOSSIP,
+            features::GOSSIP | features::PAIRWISE,
             cfg.proto,
             seq,
             now,
             cfg.validity_secs,
             cfg.decoy_sni.clone(),
             cfg.advertise.clone(),
+            endorsements.to_vec(),
         )
+    }
+
+    /// Подставляет новые (продлённые) поручительства и сразу перевыпускает запись.
+    /// Поручительства за чужой ключ отбрасываются, лишние сверх предела — тоже.
+    pub fn set_endorsements(&self, list: Vec<Endorsement>, now: u64) {
+        let mut g = self.inner.lock().unwrap();
+        let mine: Vec<Endorsement> = list
+            .into_iter()
+            // Принимаем только поручительства именно за этот узел.
+            .filter(|e| e.valid_for_keys(&self.identity.static_pub, &self.identity.signing.verifying_key().to_bytes()))
+            .take(descriptor::MAX_ENDORSEMENTS)
+            .collect();
+        if mine == g.endorsements {
+            return;
+        }
+        g.endorsements = mine;
+        let seq = (g.own.seq + 1).max(now);
+        g.own = Self::sign_own(&self.identity, &self.cfg, &g.endorsements, seq, now);
+    }
+
+    /// Живая запись об узле из каталога (не о нас самих).
+    pub fn lookup(&self, id: &NodeId, now: u64) -> Option<NodeDescriptor> {
+        self.inner.lock().unwrap().store.live_get(id, now).cloned()
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -192,7 +234,7 @@ impl Directory {
         let remaining = g.own.valid_until.saturating_sub(now);
         if remaining < self.cfg.validity_secs.min(MAX_VALIDITY_SECS) / 3 {
             let seq = (g.own.seq + 1).max(now);
-            g.own = Self::sign_own(&self.identity, &self.cfg, seq, now);
+            g.own = Self::sign_own(&self.identity, &self.cfg, &g.endorsements, seq, now);
         }
         g.own.clone()
     }
@@ -265,9 +307,57 @@ impl Directory {
             .collect()
     }
 
-    /// Допуск mesh-пира: он знает секрет роя для своего `node_id`.
+    /// Допуск mesh-пира: он знает секрет роя для своего `node_id`. В управляемой
+    /// сети (заданы ключи авторитетов) он к тому же обязан быть в каталоге с
+    /// действующим поручительством.
     pub fn validate_mesh_peer(&self, peer_id: &str, secret: &str) -> bool {
-        parse_node_id(peer_id).is_some_and(|id| self.swarm.check_node_secret(&id, secret))
+        self.validate_mesh_peer_at(peer_id, secret, unix_now())
+    }
+
+    pub fn validate_mesh_peer_at(&self, peer_id: &str, secret: &str, now: u64) -> bool {
+        let Some(id) = parse_node_id(peer_id) else {
+            return false;
+        };
+        // Секрет: `<секрет роя>` либо `<секрет роя>.<парное доказательство>`.
+        let (swarm_part, proof_part) = match secret.split_once('.') {
+            Some((s, p)) => (s, Some(p)),
+            None => (secret, None),
+        };
+        if !self.swarm.check_node_secret(&id, swarm_part) {
+            return false;
+        }
+        match self.lookup(&id, now) {
+            // Узел уже в каталоге: его личность держит парный секрет, а не ключ роя.
+            Some(known) => match proof_part {
+                Some(p) => ct_eq_str(&self.expected_proof(&known), p),
+                None => !self.cfg.strict_pairwise,
+            },
+            // Незнакомый: знакомство по ключу роя — но не в управляемой сети, где
+            // допускаются только поручённые авторитетом.
+            None => self.cfg.store.trust_anchors.is_empty(),
+        }
+    }
+
+    fn expected_proof(&self, peer: &NodeDescriptor) -> String {
+        pair_proof(&pairwise_secret(&self.identity.static_private, &peer.static_pub))
+    }
+
+    /// Секрет для mesh-токена при подключении к `peer`: наш секрет роя, а узлам с
+    /// признаком `PAIRWISE` — ещё и парное доказательство (`<роя>.<парное>`).
+    /// `None` — об этом узле в каталоге нет записи (токен выбирает вызывающий).
+    pub fn mesh_secret_for(&self, peer: &NodeId, now: u64) -> Option<String> {
+        let known = self.lookup(peer, now)?;
+        let base = self.swarm.node_secret(&self.identity.node_id);
+        Some(if known.features & features::PAIRWISE != 0 {
+            format!("{base}.{}", self.expected_proof(&known))
+        } else {
+            base
+        })
+    }
+
+    /// Работает ли сеть под авторитетом (заданы ключи).
+    pub fn is_managed(&self) -> bool {
+        !self.cfg.store.trust_anchors.is_empty()
     }
 
     /// Первое сообщение обмена (дайджест). Счётчик раундов сдвигает окно дайджеста.

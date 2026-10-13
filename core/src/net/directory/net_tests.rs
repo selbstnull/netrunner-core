@@ -14,6 +14,10 @@ struct Node {
 }
 
 async fn spawn(seed: u8, swarm: &SwarmKey) -> Node {
+    spawn_with(seed, swarm, |_| {}).await
+}
+
+async fn spawn_with(seed: u8, swarm: &SwarmKey, tune: impl FnOnce(&mut DirectoryConfig)) -> Node {
     crate::net::NetworkConfig::init_global(1500);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -21,17 +25,14 @@ async fn spawn(seed: u8, swarm: &SwarmKey) -> Node {
     let identity = SwarmIdentity::from_static_private([seed; 32]);
     let secret = swarm.node_secret(&identity.node_id);
     let local = LocalIdentity::from_hex(&secret, &hex::encode(identity.static_private), true).unwrap();
-    let dir = Arc::new(Directory::new(
-        identity,
-        swarm.clone(),
-        DirectoryConfig {
-            store: StoreConfig { allow_private: true, ..Default::default() },
-            advertise: vec![Endpoint { kind: EndpointKind::Tcp, host: "127.0.0.1".into(), port }],
-            decoy_sni: "example.com".into(),
-            ..Default::default()
-        },
-        unix_now(),
-    ));
+    let mut cfg = DirectoryConfig {
+        store: StoreConfig { allow_private: true, ..Default::default() },
+        advertise: vec![Endpoint { kind: EndpointKind::Tcp, host: "127.0.0.1".into(), port }],
+        decoy_sni: "example.com".into(),
+        ..Default::default()
+    };
+    tune(&mut cfg);
+    let dir = Arc::new(Directory::new(identity, swarm.clone(), cfg, unix_now()));
     let mesh = Arc::new(NodeMesh::with_max_hops(dir.node_id_hex(), secret, 2));
     mesh.set_onion_identity(local.clone());
     mesh.set_directory(dir.clone());
@@ -252,7 +253,7 @@ async fn a_client_learns_other_nodes_over_its_live_session_and_can_use_them() {
     let muxer = connect(&a_addr, &sw.node_secret(&a.dir.node_id()), &hex::encode(own.static_pub)).await;
     wait_leg(&muxer).await;
 
-    let cache = ClientDirectory::new(sw.clone(), true);
+    let cache = ClientDirectory::new(sw.clone(), true, Vec::new());
     let stats = crate::net::directory::client::learn_nodes(&muxer, &cache, 16).await.expect("PeerHint answered");
     assert_eq!(stats.learned(), 3, "A, B и C: {stats:?}");
 
@@ -268,4 +269,83 @@ async fn a_client_learns_other_nodes_over_its_live_session_and_can_use_them() {
     // повторный запрос ничего нового не приносит
     let again = crate::net::directory::client::learn_nodes(&muxer, &cache, 16).await.unwrap();
     assert_eq!(again.learned(), 0);
+}
+
+/// Строгий допуск на настоящих узлах: участник роя, выдающий себя за известного B-узлу
+/// A, без парного доказательства не проходит; в нестрогом режиме (совместимость) —
+/// проходит. Сам A с доказательством проходит всегда.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strict_admission_stops_a_member_from_impersonating_a_known_node() {
+    use crate::net::ClientHandler;
+    let sw = SwarmKey::from_bytes([5u8; 32]);
+
+    for strict in [true, false] {
+        let a = spawn(1, &sw).await;
+        let b = spawn_with(2, &sw, |c| c.strict_pairwise = strict).await;
+        // B знает A (запись получена знакомством)
+        b.dir.insert(a.dir.own(unix_now()), unix_now());
+        a.dir.insert(b.dir.own(unix_now()), unix_now());
+        let b_peer = a.dir.peers(unix_now()).into_iter().next().unwrap();
+
+        // Самозванец: знает ключ роя, выдаёт себя за A, но у него нет парного секрета.
+        let forged = format!("mesh4:{}:{}", a.dir.node_id_hex(), sw.node_secret(&a.dir.node_id()));
+        let impostor = ClientHandler::connect_mesh_session(&b_peer, &forged, 8443).await;
+        let impostor_admitted = match impostor {
+            Ok(s) => {
+                // отказ приходит после хендшейка — подождём, не закроет ли узел сессию
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                s.is_usable()
+            }
+            Err(_) => false,
+        };
+        assert_eq!(impostor_admitted, !strict, "strict={strict}");
+
+        // Настоящий A с парным доказательством проходит в обоих режимах.
+        let real = a.mesh.onion_auth_token_for(&b_peer);
+        assert!(real.contains('.'), "токен несёт доказательство: {real}");
+        let ok = ClientHandler::connect_mesh_session(&b_peer, &real, 8443).await.expect("real A admitted");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(ok.is_usable(), "strict={strict}");
+    }
+}
+
+/// Управляемая сеть: узел без поручительства авторитета не входит — ни по ключу роя,
+/// ни через gossip; поручённые узлы находят друг друга как обычно.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_network_admits_only_endorsed_nodes() {
+    use ed25519_dalek::SigningKey;
+    let sw = SwarmKey::from_bytes([5u8; 32]);
+    let authority = SigningKey::from_bytes(&[42u8; 32]);
+    let anchor = authority.verifying_key().to_bytes();
+    let managed = move |c: &mut DirectoryConfig| c.store.trust_anchors = vec![anchor];
+
+    let a = spawn_with(1, &sw, managed).await;
+    let b = spawn_with(2, &sw, managed).await;
+    let c = spawn_with(3, &sw, managed).await; // без поручительства
+    let now = unix_now();
+    for n in [&a, &b] {
+        let own = n.dir.own(now);
+        n.dir.set_endorsements(vec![Endorsement::issue_for(&authority, &own, now + 3600)], now);
+    }
+    // поручительство за чужой узел не принимается
+    let own_b = b.dir.own(now);
+    c.dir.set_endorsements(vec![Endorsement::issue_for(&authority, &own_b, now + 3600)], now);
+    assert!(c.dir.own(now).endorsements.is_empty());
+
+    seed(&a, &b);
+    seed(&b, &a);
+    // C знает A, но A его не знает; у C нет права войти
+    c.dir.insert(a.dir.own(unix_now()), unix_now());
+    // (C сам не принимает неподписанных: A поручён, поэтому A в каталог C попадает)
+    assert_eq!(c.dir.len(), 1);
+
+    for _ in 0..3 {
+        a.mesh.gossip_round(2).await;
+        b.mesh.gossip_round(2).await;
+        let (ok, learned) = c.mesh.gossip_round(2).await;
+        assert_eq!((ok, learned), (0, 0), "C не проходит допуск");
+    }
+    assert_eq!(a.dir.len(), 1, "A знает только B");
+    assert!(a.dir.peers(unix_now()).iter().all(|p| p.node_id != c.dir.node_id_hex()));
+    assert!(!a.dir.validate_mesh_peer(&c.dir.node_id_hex(), &sw.node_secret(&c.dir.node_id())));
 }

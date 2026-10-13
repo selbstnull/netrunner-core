@@ -10,6 +10,7 @@ netrunner-logger = { path = "../tools/log" }
 tracing = "0.1"
 hex = "0.4.3"
 rand = "0.10.0"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 tokio = { version = "1.36", features = ["full"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -18,8 +18,12 @@ use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 
-/// Версия формата записи.
+/// Версия формата записи без поручительств авторитета.
 pub const DESCRIPTOR_VERSION: u8 = 1;
+/// Версия с поручительствами внутри подписанного тела (см. [`Endorsement`]).
+pub const DESCRIPTOR_VERSION_ENDORSED: u8 = 2;
+/// Не больше стольких поручительств в одной записи.
+pub const MAX_ENDORSEMENTS: usize = 2;
 /// Не больше стольких адресов в одной записи.
 pub const MAX_ENDPOINTS: usize = 4;
 /// Максимальный срок жизни записи (выпуск → истечение).
@@ -90,6 +94,9 @@ pub mod features {
     /// Узел понимает кадр `PeerGossip`. Старым узлам неизвестный тип кадра
     /// рвёт ногу, поэтому им gossip не шлют.
     pub const GOSSIP: u8 = 1;
+    /// Узел понимает парное доказательство личности в mesh-токене
+    /// (`<секрет роя>.<доказательство>`); узлам без него шлют только секрет роя.
+    pub const PAIRWISE: u8 = 2;
 }
 
 /// Тип адреса входа.
@@ -154,6 +161,93 @@ impl std::fmt::Display for DescriptorError {
 
 impl std::error::Error for DescriptorError {}
 
+/// Поручительство авторитета за узел: «ключи этого узла допущены в сеть до `not_after`».
+///
+/// Авторитет — любой владелец ключа Ed25519, которому доверяют операторы (панель
+/// управляемой сети, федерация…); его публичный ключ задаётся узлам и клиентам как
+/// `trust_anchor`. Поручительство привязано к **личности** узла (`node_id` и оба
+/// ключа), а не к адресам: узел волен менять адреса и перевыпускать запись, а
+/// авторитет отзывает узел тем, что перестаёт продлевать поручительство. Чужое
+/// поручительство на другой узел не переносится.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endorsement {
+    /// Публичный ключ авторитета.
+    pub anchor: [u8; 32],
+    /// Unix-время, до которого поручительство действует.
+    pub not_after: u64,
+    pub signature: [u8; 64],
+}
+
+pub const ENDORSEMENT_LEN: usize = 32 + 8 + 64;
+
+fn endorsement_message(node_id: &NodeId, static_pub: &[u8; 32], sign_pub: &[u8; 32], not_after: u64) -> Vec<u8> {
+    let mut m = b"nrxp-endorse-v1\0".to_vec();
+    m.extend_from_slice(node_id);
+    m.extend_from_slice(static_pub);
+    m.extend_from_slice(sign_pub);
+    m.extend_from_slice(&not_after.to_be_bytes());
+    m
+}
+
+impl Endorsement {
+    /// Выпускает поручительство за узел с заданными ключами.
+    pub fn issue(
+        authority: &SigningKey,
+        static_pub: &[u8; 32],
+        sign_pub: &[u8; 32],
+        not_after: u64,
+    ) -> Self {
+        let node_id = derive_node_id(sign_pub, static_pub);
+        let sig = authority.sign(&endorsement_message(&node_id, static_pub, sign_pub, not_after));
+        Self {
+            anchor: authority.verifying_key().to_bytes(),
+            not_after,
+            signature: sig.to_bytes(),
+        }
+    }
+
+    /// Выпускает поручительство за уже существующую запись.
+    pub fn issue_for(authority: &SigningKey, d: &NodeDescriptor, not_after: u64) -> Self {
+        Self::issue(authority, &d.static_pub, &d.sign_pub, not_after)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ENDORSEMENT_LEN);
+        out.extend_from_slice(&self.anchor);
+        out.extend_from_slice(&self.not_after.to_be_bytes());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() != ENDORSEMENT_LEN {
+            return None;
+        }
+        Some(Self {
+            anchor: b[..32].try_into().ok()?,
+            not_after: u64::from_be_bytes(b[32..40].try_into().ok()?),
+            signature: b[40..].try_into().ok()?,
+        })
+    }
+
+    /// Подпись верна для узла с такими ключами (срок не проверяется).
+    pub fn valid_for_keys(&self, static_pub: &[u8; 32], sign_pub: &[u8; 32]) -> bool {
+        let Ok(vk) = VerifyingKey::from_bytes(&self.anchor) else {
+            return false;
+        };
+        let node_id = derive_node_id(sign_pub, static_pub);
+        vk.verify_strict(
+            &endorsement_message(&node_id, static_pub, sign_pub, self.not_after),
+            &Signature::from_bytes(&self.signature),
+        )
+        .is_ok()
+    }
+
+    fn valid_for(&self, d: &NodeDescriptor) -> bool {
+        self.valid_for_keys(&d.static_pub, &d.sign_pub)
+    }
+}
+
 /// Подписанное самоописание узла.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDescriptor {
@@ -173,6 +267,9 @@ pub struct NodeDescriptor {
     pub valid_until: u64,
     pub decoy_sni: String,
     pub endpoints: Vec<Endpoint>,
+    /// Поручительства авторитетов (внутри подписанного тела: узел перевыпускает
+    /// запись, получив продление).
+    pub endorsements: Vec<Endorsement>,
     pub signature: [u8; 64],
 }
 
@@ -185,7 +282,13 @@ impl NodeDescriptor {
     /// Тело записи без подписи (то, что подписывается).
     fn body(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(160);
-        out.push(DESCRIPTOR_VERSION);
+        // Без поручительств формат прежний (версия 1): записи совместимы с узлами,
+        // которые поручительств не знают.
+        out.push(if self.endorsements.is_empty() {
+            DESCRIPTOR_VERSION
+        } else {
+            DESCRIPTOR_VERSION_ENDORSED
+        });
         out.extend_from_slice(&self.node_id);
         out.extend_from_slice(&self.static_pub);
         out.extend_from_slice(&self.sign_pub);
@@ -202,6 +305,12 @@ impl NodeDescriptor {
             out.push(e.kind as u8);
             put_str(&mut out, &e.host);
             out.extend_from_slice(&e.port.to_be_bytes());
+        }
+        if !self.endorsements.is_empty() {
+            out.push(self.endorsements.len() as u8);
+            for e in &self.endorsements {
+                out.extend_from_slice(&e.encode());
+            }
         }
         out
     }
@@ -226,6 +335,27 @@ impl NodeDescriptor {
         decoy_sni: String,
         endpoints: Vec<Endpoint>,
     ) -> Self {
+        Self::sign_endorsed(
+            signing, static_pub, roles, features, proto, seq, issued_at, valid_secs, decoy_sni,
+            endpoints, Vec::new(),
+        )
+    }
+
+    /// То же с поручительствами авторитетов внутри подписанного тела.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_endorsed(
+        signing: &SigningKey,
+        static_pub: [u8; 32],
+        roles: Roles,
+        features: u8,
+        proto: (u8, u8),
+        seq: u64,
+        issued_at: u64,
+        valid_secs: u64,
+        decoy_sni: String,
+        endpoints: Vec<Endpoint>,
+        endorsements: Vec<Endorsement>,
+    ) -> Self {
         let sign_pub = signing.verifying_key().to_bytes();
         let mut d = Self {
             node_id: derive_node_id(&sign_pub, &static_pub),
@@ -240,6 +370,7 @@ impl NodeDescriptor {
             valid_until: issued_at + valid_secs.min(MAX_VALIDITY_SECS),
             decoy_sni,
             endpoints,
+            endorsements,
             signature: [0u8; 64],
         };
         d.signature = signing.sign(&d.signing_bytes()).to_bytes();
@@ -257,7 +388,7 @@ impl NodeDescriptor {
     pub fn decode(b: &[u8]) -> Result<Self, DescriptorError> {
         let mut c = Cursor { b, p: 0 };
         let version = c.u8()?;
-        if version != DESCRIPTOR_VERSION {
+        if version != DESCRIPTOR_VERSION && version != DESCRIPTOR_VERSION_ENDORSED {
             return Err(DescriptorError::BadVersion(version));
         }
         let node_id: NodeId = c.arr()?;
@@ -282,6 +413,17 @@ impl NodeDescriptor {
             let port = u16::from_be_bytes(c.arr()?);
             endpoints.push(Endpoint { kind, host, port });
         }
+        let mut endorsements = Vec::new();
+        if version == DESCRIPTOR_VERSION_ENDORSED {
+            let n = c.u8()? as usize;
+            if n == 0 || n > MAX_ENDORSEMENTS {
+                return Err(DescriptorError::Malformed("endorsement count"));
+            }
+            for _ in 0..n {
+                let raw = c.take(ENDORSEMENT_LEN)?;
+                endorsements.push(Endorsement::decode(raw).ok_or(DescriptorError::Malformed("endorsement"))?);
+            }
+        }
         let signature: [u8; 64] = c.arr()?;
         if c.p != b.len() {
             return Err(DescriptorError::Malformed("trailing bytes"));
@@ -299,6 +441,7 @@ impl NodeDescriptor {
             valid_until,
             decoy_sni,
             endpoints,
+            endorsements,
             signature,
         })
     }
@@ -345,6 +488,16 @@ impl NodeDescriptor {
     /// Первый адрес заданного типа.
     pub fn endpoint(&self, kind: EndpointKind) -> Option<&Endpoint> {
         self.endpoints.iter().find(|e| e.kind == kind)
+    }
+
+    /// До какого времени запись поручена одним из `anchors` (`None` — не поручена).
+    /// Проверяются подписи; срок самого поручительства берётся как есть.
+    pub fn endorsed_until(&self, anchors: &[[u8; 32]]) -> Option<u64> {
+        self.endorsements
+            .iter()
+            .filter(|e| anchors.contains(&e.anchor) && e.valid_for(self))
+            .map(|e| e.not_after)
+            .max()
     }
 
     pub fn supports_gossip(&self) -> bool {

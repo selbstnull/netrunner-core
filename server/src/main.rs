@@ -160,6 +160,39 @@ struct Args {
     #[arg(long)]
     print_descriptor: bool,
 
+    /// Публичный ключ авторитета (hex, Ed25519). Задан — сеть **управляемая**: узел
+    /// принимает только записи с действующим поручительством этого авторитета
+    /// (панель или иной подписант). Не задан — открытая сеть (рой). Можно несколько.
+    #[arg(long, env = "NETRUNNER_TRUST_ANCHOR", value_delimiter = ',')]
+    trust_anchor: Vec<String>,
+
+    /// Поручительство авторитета за этот узел: hex либо путь к файлу (по записи в
+    /// строке). Файл перечитывается каждый раунд — продление подхватывается без
+    /// перезапуска. Получить: `--authority-endorse`.
+    #[arg(long, env = "NETRUNNER_ENDORSEMENT", value_delimiter = ',')]
+    endorsement: Vec<String>,
+
+    /// Строгий допуск пиров: о ком в каталоге уже есть запись, тот обязан предъявить
+    /// парное доказательство личности. Включайте, когда все узлы роя обновлены.
+    #[arg(long)]
+    swarm_strict: bool,
+
+    /// Создать пару ключей авторитета (секрет — храните, публичный — в `--trust-anchor`) и выйти.
+    #[arg(long)]
+    authority_keygen: bool,
+
+    /// Выдать поручительство за узел с этим самоописанием (hex из `--print-descriptor`),
+    /// ключом `--authority-key`, на `--endorse-days` дней, и выйти.
+    #[arg(long, value_name = "DESCRIPTOR_HEX")]
+    authority_endorse: Option<String>,
+
+    /// Секретный ключ авторитета (hex, 32 байта) для `--authority-endorse`.
+    #[arg(long, env = "NETRUNNER_AUTHORITY_KEY", hide_env_values = true)]
+    authority_key: Option<String>,
+
+    #[arg(long, default_value_t = 7)]
+    endorse_days: u64,
+
     /// Требовать валидный Bearer-токен (выданный `netrunner-backend`) от
     /// каждого клиента и отчитываться о расходе трафика для динамических
     /// лимитов. Выключено по умолчанию — включается по инстансу, не меняя
@@ -225,6 +258,11 @@ fn main() {
         );
     }
 
+    if args.authority_keygen || args.authority_endorse.is_some() {
+        authority_tool(&args);
+        return;
+    }
+
     // Рой без панели: каталог узла строится из подписанных самоописаний.
     let swarm_directory: Option<Arc<netrunner_core::net::directory::Directory>> = args
         .swarm_key
@@ -243,8 +281,10 @@ fn main() {
         return;
     }
     let swarm_mode = swarm_directory.is_some();
-    // В режиме роя панель нужна только для учётных записей пользователей.
-    let auth_required_by_node = args.require_auth || (args.mesh_enabled && !swarm_mode);
+    // В режиме роя панель по умолчанию не нужна. Задан `--backend-url` — гибрид:
+    // пользователи, пиры и допуск берутся и из панели, и из каталога.
+    let hybrid_panel = swarm_mode && args.backend_url.is_some();
+    let auth_required_by_node = args.require_auth || (args.mesh_enabled && !swarm_mode) || hybrid_panel;
     let backend_url = if auth_required_by_node {
         Some(
             args.backend_url
@@ -282,9 +322,14 @@ fn main() {
     };
 
     let mesh = if let Some(dir) = &swarm_directory {
-        let node_secret = dir.swarm().node_secret(&dir.node_id());
+        // Основной идентификатор для пиров панели — как у обычного узла (если узел в
+        // панели зарегистрирован); пирам роя узел представляется роевым.
+        let (mesh_id, node_secret) = match (hybrid_panel, std::env::var("PROXY_NODE_ID"), &internal_secret) {
+            (true, Ok(panel_id), Some(secret)) => (panel_id, secret.clone()),
+            _ => (dir.node_id_hex(), dir.swarm().node_secret(&dir.node_id())),
+        };
         let mesh = Arc::new(netrunner_core::net::NodeMesh::with_max_hops_and_quic_port(
-            dir.node_id_hex(),
+            mesh_id,
             node_secret,
             args.mesh_max_hops,
             args.mesh_quic_port,
@@ -548,7 +593,8 @@ fn main() {
         cover_flight,
         honor_requested_sni,
     )
-    .with_directory(args.directory_file.clone(), args.directory_gossip_interval);
+    .with_directory(args.directory_file.clone(), args.directory_gossip_interval)
+    .with_endorsements(args.endorsement.clone());
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
@@ -608,8 +654,11 @@ fn build_directory(args: &Args, swarm_key: &str) -> Arc<netrunner_core::net::dir
         DirectoryConfig {
             store: StoreConfig {
                 allow_private: args.directory_allow_private,
+                trust_anchors: parse_anchors(&args.trust_anchor),
                 ..Default::default()
             },
+            endorsements: load_endorsements(&args.endorsement),
+            strict_pairwise: args.swarm_strict,
             advertise: vec![Endpoint {
                 kind: EndpointKind::Tcp,
                 host: host.to_string(),
@@ -651,6 +700,66 @@ fn build_directory(args: &Args, swarm_key: &str) -> Arc<netrunner_core::net::dir
         "swarm directory ready"
     );
     Arc::new(directory)
+}
+
+/// Публичные ключи авторитетов из флага (hex, 32 байта).
+fn parse_anchors(list: &[String]) -> Vec<[u8; 32]> {
+    list.iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            hex::decode(s.trim())
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .unwrap_or_else(|| panic!("--trust-anchor: ожидается 32 байта в hex, получено {s:?}"))
+        })
+        .collect()
+}
+
+/// Поручительства из флага: hex либо файл с записью в строке; битые пропускаются с
+/// предупреждением (узел продолжает работать и без них — соседи просто его не примут).
+pub(crate) fn load_endorsements(sources: &[String]) -> Vec<netrunner_core::net::directory::Endorsement> {
+    let mut out = Vec::new();
+    for src in sources.iter().filter(|s| !s.trim().is_empty()) {
+        let text = std::fs::read_to_string(src).unwrap_or_else(|_| src.clone());
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            match hex::decode(line).ok().and_then(|b| netrunner_core::net::directory::Endorsement::decode(&b)) {
+                Some(e) => out.push(e),
+                None => netrunner_logger::warn!("endorsement: запись не разобрана, пропущена"),
+            }
+        }
+    }
+    out
+}
+
+/// `--authority-keygen` и `--authority-endorse`: инструмент авторитета.
+fn authority_tool(args: &Args) {
+    use ed25519_dalek::SigningKey;
+    use netrunner_core::net::directory::{unix_now, Endorsement, NodeDescriptor};
+    if args.authority_keygen {
+        let secret: [u8; 32] = rand::random();
+        let key = SigningKey::from_bytes(&secret);
+        println!("authority_secret  {}", hex::encode(secret));
+        println!("authority_public  {}   # в --trust-anchor узлов и клиентов", hex::encode(key.verifying_key().to_bytes()));
+        return;
+    }
+    let desc_hex = args.authority_endorse.as_deref().expect("checked by caller");
+    let secret = args
+        .authority_key
+        .as_deref()
+        .expect("--authority-endorse требует --authority-key (или NETRUNNER_AUTHORITY_KEY)");
+    let secret: [u8; 32] = hex::decode(secret.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .expect("--authority-key: 32 байта в hex");
+    let desc = hex::decode(desc_hex.trim())
+        .ok()
+        .and_then(|b| NodeDescriptor::decode(&b).ok())
+        .expect("--authority-endorse: ожидается hex самоописания из --print-descriptor");
+    let now = unix_now();
+    desc.verify(now, true).unwrap_or_else(|e| panic!("самоописание не проходит проверку: {e}"));
+    let e = Endorsement::issue_for(&SigningKey::from_bytes(&secret), &desc, now + args.endorse_days * 86_400);
+    println!("# поручительство за {} до {} (Unix)", hex::encode(desc.node_id), e.not_after);
+    println!("{}", hex::encode(e.encode()));
 }
 
 #[cfg(test)]

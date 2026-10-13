@@ -125,8 +125,23 @@ key fails the `ClientHello` tag. Mesh-peer admission: the peer presents the secr
 
 > **An interim link.** The swarm key is a shared secret; its leak removes the entry barrier of the
 > network (but does not allow impersonating a node: identity is held by the static key in the
-> handshake). Any member can compute any neighbour's secret, so admission means "a swarm member", not
-> "exactly this node". Stages B–C replace it with tokens and pairwise secrets.
+> handshake). The swarm key answers "are you a member of the network"; "are you exactly this node" is
+> answered by the pairwise secret (below). Tokens instead of the swarm key — stage B.
+
+**Pairwise identity.** For two nodes `A` and `B` a pairwise secret is computed from static DH
+(`pairwise_secret = HKDF(X25519(a, B_pub) ‖ keys)`, symmetric); only the two of them know it. When
+connecting to `B`, node `A` puts `<swarm secret>.<proof>` into the mesh token, where the proof is 128 bits
+derived from the pairwise secret. For a node that already has a record in the directory `B` demands the
+proof: a swarm member without the pairwise secret cannot pass for a known node, and an overheard proof is
+useless for another pair. An unfamiliar swarm member is introduced by the swarm key (otherwise a new node
+could not join). Compatibility:
+
+* the proof is sent only to nodes with the `PAIRWISE` feature in their record; the rest get the old token
+  with the swarm secret alone;
+* **strict mode** (`--swarm-strict`) requires the proof from known nodes; while it is off the node also
+  accepts the old token — turn it on once every swarm node is updated.
+* the token with the proof fits the secret field limit (128 characters; checked by a test — the first
+  version with a 64-character proof hit this limit and broke real sessions).
 
 ### 5.5 A node without the panel
 
@@ -206,6 +221,7 @@ node_public_key = "…"
 swarm_key = "<swarm key, 64 hex>"       # enables swarm mode and list refresh
 # directory_file = "/var/lib/netrunner/directory.bin"
 # learn_nodes = false                   # or --no-learn-nodes: cache and [[nodes]] only
+# trust_anchors = ["<authority key>"]   # managed swarm: endorsed nodes only (5.8)
 ```
 
 Client requests are counted in a separate rate window (`max_hints_per_window`, 30 per 10 s) so a flood of
@@ -215,7 +231,45 @@ the request, but a node of an older release drops the leg on the unknown frame �
 a client knew one node, learned the others, the primary node was stopped — the next start with the same
 config connected to a learned node.
 
-### 5.8 Number of legs
+### 5.8 The centre as an option: hybrid and managed swarm
+
+The swarm does not cancel the panel; it stands beside it. Modes are chosen by flags and are off by default.
+
+| Mode | How to enable | Where peers come from | Peer admission |
+|---|---|---|---|
+| **Centre** (default) | no `--swarm-key` | the panel | the panel |
+| **Hybrid** | `--swarm-key` + `--backend-url` | panel ∪ directory | the panel **or** a swarm member |
+| **Swarm** | `--swarm-key` | the directory | a swarm member (+ pairwise identity) |
+| **Managed swarm** | `--swarm-key` + `--trust-anchor` | the directory, endorsed nodes only | a swarm member **and** a valid endorsement |
+
+* **Hybrid.** `DirectoryValidator` merges the panel's list and the directory's (on a matching address or
+  id the panel wins; an unreachable panel does not switch the directory off); admission is "the panel
+  confirmed or a swarm member". The node presents its panel identifier (`PROXY_NODE_ID`) to panel peers
+  and its swarm identifier to swarm peers. Users and billing stay in the panel. Limitation: the old
+  `mesh2/mesh3` routes (two-node, without onion capsules) use the main identity, so peers known only to the
+  swarm are reached over onion (`mesh4`) routes.
+* An **authority** is any holder of an Ed25519 key (a panel, a federation). Its public key is given to nodes
+  and clients as `--trust-anchor` (for a client — `trust_anchors` in `client.toml`). It issues a node an
+  **endorsement**: "this node's keys are admitted until `not_after`". The endorsement is bound to the
+  node's identity (`node_id` and both keys), not to addresses, and lives inside the signed record (format
+  version 2; records without endorsements stay version 1 and remain compatible with old nodes). A node takes
+  from gossip and `PeerHint` only records with a valid endorsement; a record lives no longer than it.
+  **Revocation** — stop renewing the endorsement. Renewal is picked up without a restart (`--endorsement`
+  is re-read every round).
+* The authority tooling is built into `netrunner-server`:
+
+```bash
+netrunner-server --authority-keygen                       # authority_secret / authority_public
+netrunner-server --swarm-key … --advertise … --print-descriptor      # the node's descriptor <hex>
+netrunner-server --authority-endorse <descriptor hex> --authority-key <secret> --endorse-days 7
+netrunner-server … --trust-anchor <authority_public> --endorsement /etc/netrunner/endorsement.txt
+```
+
+Verified with real binaries: a mixed swarm of one node of the previous release and two new ones converged
+(two records each); in a managed swarm the endorsed nodes found each other while a node without an
+endorsement got no admission, neither by the swarm key nor through gossip.
+
+### 5.9 Number of legs
 
 In the same release the number of parallel TCP legs became a client setting: 1–10, default 4
 (`--tunnel-legs`, `tunnel_legs`, `SessionParams.tunnel_legs`, a setting in the app). The limit of 10 is
@@ -268,7 +322,9 @@ needs.
 
 * Gossip over connections the node dialled itself (behind NAT): today exchange goes only to nodes with a
   public address. The base exists — reverse egress — but it needs `validate_egress` in the backend/swarm.
-* Mesh-peer admission by pairwise secrets from static DH and a challenge-response instead of the swarm key.
+* The `ClientHello` barrier is still derived from the swarm key (the pairwise identity stops impersonating a
+  known node, but not an outsider with the swarm key entering: that needs tokens, stage B). A full
+  challenge-response instead of the static proof — after tokens appear.
 * A compact digest (IBLT/Merkle) for directories of thousands of nodes.
 * `EXIT`/`BRIDGE` roles in routing (only `RELAY` is considered now).
 * Masking of node-to-node links (mesh-QUIC with the ALPN `nrxp-mesh/1` differs from a browser).

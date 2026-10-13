@@ -109,9 +109,17 @@ pub struct Network {
     /// Файл каталога (рой без панели) и период обмена записями с соседями, секунды.
     directory_file: Option<std::path::PathBuf>,
     gossip_interval_secs: u64,
+    /// Источники поручительств (hex или файлы): перечитываются каждый раунд.
+    endorsement_sources: Vec<String>,
 }
 
 impl Network {
+    /// Откуда брать поручительства авторитета за этот узел (управляемая сеть).
+    pub fn with_endorsements(mut self, sources: Vec<String>) -> Self {
+        self.endorsement_sources = sources;
+        self
+    }
+
     /// Настройки каталога роя: куда сохранять записи и как часто обмениваться.
     pub fn with_directory(
         mut self,
@@ -152,6 +160,7 @@ impl Network {
             honor_requested_sni,
             directory_file: None,
             gossip_interval_secs: 15,
+            endorsement_sources: Vec::new(),
         }
     }
 
@@ -214,9 +223,17 @@ impl Network {
             if let Some(directory) = mesh.directory() {
                 let file = self.directory_file.clone();
                 let interval = self.gossip_interval_secs;
+                let endorsement_sources = self.endorsement_sources.clone();
                 tokio::spawn(async move {
                     let mut last_saved = 0usize;
                     loop {
+                        // Продление поручительства подхватывается без перезапуска.
+                        if !endorsement_sources.is_empty() {
+                            directory.set_endorsements(
+                                crate::load_endorsements(&endorsement_sources),
+                                netrunner_core::net::directory::unix_now(),
+                            );
+                        }
                         let (ok, learned) = mesh.gossip_round(2).await;
                         let now = netrunner_core::net::directory::unix_now();
                         let expired = directory.gc(now);

@@ -206,11 +206,11 @@ impl NodeMesh {
     /// `Heartbeat` frame on an already pooled session, at most every few minutes.
     pub async fn refresh_peer_caps(&self) {
         let peers = self.peers.read().await.clone();
-        let token = self.onion_auth_token();
         for peer in peers {
             if !self.caps.peer_caps_stale(&peer.node_id) {
                 continue;
             }
+            let token = self.onion_auth_token_for(&peer);
             let Ok(session) = self.peer_session(&peer, &token, None).await else {
                 continue;
             };
@@ -232,6 +232,20 @@ impl NodeMesh {
 
     pub(crate) fn onion_auth_token(&self) -> String {
         format!("mesh4:{}:{}", self.local_node_id, self.local_node_secret)
+    }
+
+    /// Токен для подключения к конкретному пиру. Пир из каталога роя получает наш
+    /// роевой идентификатор и секрет (с парным доказательством, если он его понимает);
+    /// остальным (пирам панели) — основной идентификатор узла, как и раньше.
+    pub(crate) fn onion_auth_token_for(&self, peer: &MeshPeer) -> String {
+        if let Some(dir) = self.directory.get() {
+            if let Some(id) = crate::net::directory::parse_node_id(&peer.node_id) {
+                if let Some(secret) = dir.mesh_secret_for(&id, crate::net::directory::unix_now()) {
+                    return format!("mesh4:{}:{}", dir.node_id_hex(), secret);
+                }
+            }
+        }
+        self.onion_auth_token()
     }
 
     /// Подключает каталог. Вызывается один раз при старте; повторный вызов игнорируется.
@@ -260,7 +274,7 @@ impl NodeMesh {
         }
         let (mut ok, mut learned) = (0usize, 0usize);
         for peer in peers.into_iter().take(fanout.max(1)) {
-            let token = self.onion_auth_token();
+            let token = self.onion_auth_token_for(&peer);
             let outcome = async {
                 let session = self.peer_session(&peer, &token, None).await?;
                 session.gossip_exchange(&directory, now).await
@@ -1126,7 +1140,7 @@ impl NodeMesh {
         cancel: Option<&CancellationToken>,
         avoid_stream_id: Option<u32>,
     ) -> Result<(Arc<MeshPeerSession>, u32, mpsc::Receiver<Bytes>), AppError> {
-        let auth_token = self.onion_auth_token();
+        let auth_token = self.onion_auth_token_for(peer);
         let session = self.peer_session(peer, &auth_token, cancel).await?;
         let (stream_id, receiver) = session
             .open_onion_stream(capsule, is_udp, cancel, avoid_stream_id)

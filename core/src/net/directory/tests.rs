@@ -240,7 +240,7 @@ fn store_limits_nodes_per_network_prefix() {
 #[test]
 fn store_is_bounded_and_evicts_the_soonest_to_expire() {
     let mut s = DescriptorStore::new(
-        StoreConfig { max_records: 4, max_per_prefix: 100, allow_private: true },
+        StoreConfig { max_records: 4, max_per_prefix: 100, allow_private: true, ..Default::default() },
         None,
     );
     for i in 1..=4u8 {
@@ -276,7 +276,7 @@ fn store_ignores_its_own_record_and_expires_old_ones() {
 #[test]
 fn digest_window_rotates_over_a_large_store() {
     let mut s = DescriptorStore::new(
-        StoreConfig { max_records: 5000, max_per_prefix: 100_000, allow_private: true },
+        StoreConfig { max_records: 5000, max_per_prefix: 100_000, allow_private: true, ..Default::default() },
         None,
     );
     let n = store::MAX_DIGEST_ENTRIES + 120;
@@ -661,7 +661,7 @@ fn the_client_cache_verifies_derives_credentials_and_persists() {
     for i in 0..4u8 {
         server.insert(desc_with(30 + i, &format!("10.{}.0.1", 40 + i), 1, Roles::RELAY, T0, 3600), T0);
     }
-    let client = ClientDirectory::new(sw.clone(), true);
+    let client = ClientDirectory::new(sw.clone(), true, Vec::new());
     assert!(client.is_empty());
 
     let reply = {
@@ -696,11 +696,11 @@ fn the_client_cache_verifies_derives_credentials_and_persists() {
 
     // кэш переживает перезапуск, истёкшее отбрасывается
     let snap = client.save(T0 + 1);
-    let again = ClientDirectory::new(sw.clone(), true);
+    let again = ClientDirectory::new(sw.clone(), true, Vec::new());
     assert_eq!(again.load(&snap, T0 + 1), 5);
     assert_eq!(again.nodes(T0 + 200_000, &Default::default()).len(), 0);
     // без ключа роя учётные данные чужие: клиент другого роя получает другие секреты
-    let other = ClientDirectory::new(SwarmKey::from_bytes([1u8; 32]), true);
+    let other = ClientDirectory::new(SwarmKey::from_bytes([1u8; 32]), true, Vec::new());
     other.load(&snap, T0 + 1);
     assert_ne!(other.nodes(T0 + 1, &Default::default())[0].node_secret, nodes[0].node_secret);
 }
@@ -708,7 +708,7 @@ fn the_client_cache_verifies_derives_credentials_and_persists() {
 #[test]
 fn only_ipv4_relays_become_client_candidates() {
     let sw = swarm();
-    let client = ClientDirectory::new(sw, true);
+    let client = ClientDirectory::new(sw, true, Vec::new());
     let mk = |seed: u8, host: &str, roles: u8| desc_with(seed, host, 1, roles, T0, 3600);
     let mut st = store();
     for d in [mk(1, "10.1.0.1", Roles::RELAY), mk(2, "node.example.org", Roles::RELAY), mk(3, "2001:db8::1", Roles::RELAY), mk(4, "10.4.0.1", Roles::EXIT)] {
@@ -719,4 +719,374 @@ fn only_ipv4_relays_become_client_candidates() {
     let nodes = client.nodes(T0, &Default::default());
     assert_eq!(nodes.len(), 1, "{nodes:?}");
     assert_eq!(nodes[0].address, "10.1.0.1:443");
+}
+
+// ───────────────── поручительства, управляемая сеть, парные секреты ─────────────────
+
+use ed25519_dalek::SigningKey;
+
+fn authority(n: u8) -> (SigningKey, [u8; 32]) {
+    let k = SigningKey::from_bytes(&[n; 32]);
+    let p = k.verifying_key().to_bytes();
+    (k, p)
+}
+
+fn endorsed(seed: u8, host: &str, seq: u64, auth: &SigningKey, until: u64) -> NodeDescriptor {
+    let id = SwarmIdentity::from_static_private([seed; 32]);
+    let sp = id.signing.verifying_key().to_bytes();
+    NodeDescriptor::sign_endorsed(
+        &id.signing, id.static_pub, Roles(Roles::RELAY), features::GOSSIP, (2, 6), seq, T0, 3600, String::new(),
+        vec![Endpoint { kind: EndpointKind::Tcp, host: host.into(), port: 443 }],
+        vec![Endorsement::issue(auth, &id.static_pub, &sp, until)],
+    )
+}
+
+fn managed_store(anchor: [u8; 32]) -> DescriptorStore {
+    DescriptorStore::new(
+        StoreConfig { allow_private: true, trust_anchors: vec![anchor], ..Default::default() },
+        None,
+    )
+}
+
+#[test]
+fn unendorsed_records_keep_the_old_wire_format_and_endorsed_ones_round_trip() {
+    let plain = desc_with(1, "10.0.0.1", 1, Roles::RELAY, T0, 3600);
+    assert_eq!(plain.encode()[0], 1, "без поручительств формат прежний — совместим со старыми узлами");
+    assert!(plain.endorsements.is_empty());
+
+    let (k, _) = authority(9);
+    let d = endorsed(2, "10.0.0.2", 1, &k, T0 + 100_000);
+    let bytes = d.encode();
+    assert_eq!(bytes[0], 2);
+    let back = NodeDescriptor::decode(&bytes).unwrap();
+    assert_eq!(back, d);
+    assert_eq!(back.verify(T0 + 1, true), Ok(()));
+    assert_eq!(back.endorsed_until(&[authority(9).1]), Some(T0 + 100_000));
+    assert_eq!(back.endorsed_until(&[authority(8).1]), None, "чужой авторитет");
+    assert_eq!(back.endorsed_until(&[]), None);
+
+    // поручительство внутри подписанного тела: любой байт записи защищён
+    let sig_start = bytes.len() - 64;
+    for i in 0..sig_start {
+        let mut b = bytes.clone();
+        b[i] ^= 0x01;
+        if let Ok(x) = NodeDescriptor::decode(&b) {
+            let ok = x.verify(T0 + 1, true).is_ok() && x.endorsed_until(&[authority(9).1]).is_some();
+            assert!(!ok, "byte {i} not protected");
+        }
+    }
+    // число поручительств: 0 и больше предела — ошибка разбора
+    let mut zero = bytes.clone();
+    let count_pos = bytes.len() - 64 - descriptor::ENDORSEMENT_LEN - 1;
+    zero[count_pos] = 0;
+    assert!(NodeDescriptor::decode(&zero).is_err());
+    zero[count_pos] = 3;
+    assert!(NodeDescriptor::decode(&zero).is_err());
+}
+
+#[test]
+fn an_endorsement_binds_to_the_node_identity_and_cannot_be_moved() {
+    let (k, anchor) = authority(9);
+    let a = SwarmIdentity::from_static_private([1; 32]);
+    let b = SwarmIdentity::from_static_private([2; 32]);
+    let e_for_a = Endorsement::issue(&k, &a.static_pub, &a.signing.verifying_key().to_bytes(), T0 + 1000);
+    // запись B с поручительством за A
+    let stolen = NodeDescriptor::sign_endorsed(
+        &b.signing, b.static_pub, Roles(Roles::RELAY), 1, (2, 6), 1, T0, 3600, String::new(),
+        vec![Endpoint { kind: EndpointKind::Tcp, host: "10.0.0.2".into(), port: 443 }],
+        vec![e_for_a.clone()],
+    );
+    assert_eq!(stolen.endorsed_until(&[anchor]), None);
+    assert!(!e_for_a.valid_for_keys(&b.static_pub, &b.signing.verifying_key().to_bytes()));
+    assert!(e_for_a.valid_for_keys(&a.static_pub, &a.signing.verifying_key().to_bytes()));
+    // срок входит в подпись
+    let mut longer = e_for_a.clone();
+    longer.not_after += 10_000;
+    assert!(!longer.valid_for_keys(&a.static_pub, &a.signing.verifying_key().to_bytes()));
+    assert_eq!(Endorsement::decode(&e_for_a.encode()).unwrap(), e_for_a);
+    assert!(Endorsement::decode(&[0u8; 5]).is_none());
+}
+
+#[test]
+fn a_managed_store_takes_only_currently_endorsed_records() {
+    let (k, anchor) = authority(9);
+    let (k2, _) = authority(8);
+    let mut s = managed_store(anchor);
+
+    // без поручительства (но с верной самоподписью) — нет
+    assert_eq!(
+        s.insert(desc_with(1, "10.0.1.1", 1, Roles::RELAY, T0, 3600), T0),
+        Insert::Rejected(Reject::NotEndorsed)
+    );
+    // поручительство чужого авторитета — нет
+    assert_eq!(s.insert(endorsed(2, "10.0.2.1", 1, &k2, T0 + 5000), T0), Insert::Rejected(Reject::NotEndorsed));
+    // истёкшее поручительство — нет
+    assert_eq!(s.insert(endorsed(3, "10.0.3.1", 1, &k, T0 - 1), T0), Insert::Rejected(Reject::NotEndorsed));
+    // действующее — да
+    assert_eq!(s.insert(endorsed(4, "10.0.4.1", 1, &k, T0 + 5000), T0), Insert::Added);
+    assert_eq!(s.live(T0).count(), 1);
+
+    // поручительство короче записи: узел исчезает вместе с ним
+    assert_eq!(s.live(T0 + 5001).count(), 0, "запись ещё жива, но поручительство истекло");
+    assert_eq!(s.gc(T0 + 5001), 1);
+    assert!(s.is_empty());
+
+    // продление: новая запись с большим seq и новым поручительством заменяет прежнюю
+    assert_eq!(s.insert(endorsed(4, "10.0.4.1", 2, &k, T0 + 9000), T0), Insert::Added);
+    assert_eq!(s.insert(endorsed(4, "10.0.4.1", 3, &k, T0 + 20_000), T0), Insert::Updated);
+    assert_eq!(s.live(T0 + 15_000).count(), 0, "запись истекла сама (3600 с), хоть поручительство дольше");
+    assert_eq!(s.live(T0 + 3000).count(), 1);
+}
+
+#[test]
+fn an_open_store_ignores_endorsements_entirely() {
+    let (k, _) = authority(9);
+    let mut s = store();
+    assert_eq!(s.insert(endorsed(1, "10.0.1.1", 1, &k, T0 + 5000), T0), Insert::Added);
+    assert_eq!(s.insert(desc_with(2, "10.0.2.1", 1, Roles::RELAY, T0, 3600), T0), Insert::Added);
+}
+
+#[test]
+fn managed_nodes_gossip_among_themselves_and_an_intruder_stays_out() {
+    let sw = swarm();
+    let (k, anchor) = authority(9);
+    let mk = |seed: u8, host: &str| {
+        dir_with(seed, host, &sw, |c| c.store.trust_anchors = vec![anchor])
+    };
+    let a = mk(1, "10.0.0.1");
+    let b = mk(2, "10.0.1.1");
+    let intruder = mk(3, "10.0.2.1");
+    for d in [&a, &b] {
+        let own = d.own(T0);
+        d.set_endorsements(vec![Endorsement::issue_for(&k, &own, T0 + 5000)], T0 + 1);
+    }
+    assert_eq!(a.own(T0 + 1).endorsements.len(), 1);
+    assert!(a.own(T0 + 1).seq > 0);
+
+    a.insert(b.own(T0 + 1), T0 + 1);
+    let (sa, sb) = exchange(&a, &b, T0 + 2);
+    assert_eq!(sa.learned() + sb.learned(), 1, "B узнаёт об A, A про B уже знал: {sa:?} {sb:?}");
+
+    // непоручённый узел толкает свою запись — отвергнута
+    let push = Message::Push(vec![intruder.own(T0)]).encode();
+    let Ok(Handled::Absorbed(st)) = a.handle_incoming(&push, T0 + 2) else { panic!() };
+    assert_eq!((st.learned(), st.rejected), (0, 1));
+    assert_eq!(a.len(), 1);
+
+    // допуск пира: незнакомый непоручённый не проходит даже с ключом роя; поручённый знакомый — да
+    assert!(!a.validate_mesh_peer_at(&intruder.node_id_hex(), &sw.node_secret(&intruder.node_id()), T0 + 2));
+    let b_secret = a.mesh_secret_for(&b.node_id(), T0 + 2).map(|s| s.split('.').next().unwrap().to_string());
+    assert_eq!(b_secret, Some(sw.node_secret(&a.node_id())), "это наш секрет, не B");
+    assert!(a.validate_mesh_peer_at(&b.node_id_hex(), &b.mesh_secret_for(&a.node_id(), T0 + 2).unwrap_or_else(|| sw.node_secret(&b.node_id())), T0 + 2)
+        || a.validate_mesh_peer_at(&b.node_id_hex(), &sw.node_secret(&b.node_id()), T0 + 2));
+    // после истечения поручительства узел перестаёт быть допущенным
+    assert!(!a.validate_mesh_peer_at(&b.node_id_hex(), &sw.node_secret(&b.node_id()), T0 + 6000));
+    assert!(a.is_managed() && !dir(9, "10.0.9.1", &sw).is_managed());
+}
+
+#[test]
+fn set_endorsements_reissues_the_record_only_when_something_changed() {
+    let sw = swarm();
+    let (k, anchor) = authority(9);
+    let (k2, _) = authority(7);
+    let d = dir_with(1, "10.0.0.1", &sw, |c| c.store.trust_anchors = vec![anchor]);
+    let own = d.own(T0);
+    let e = Endorsement::issue_for(&k, &own, T0 + 5000);
+    d.set_endorsements(vec![e.clone()], T0 + 1);
+    let first = d.own(T0 + 1);
+    assert_eq!(first.endorsements, vec![e.clone()]);
+    d.set_endorsements(vec![e.clone()], T0 + 2);
+    assert_eq!(d.own(T0 + 2).seq, first.seq, "то же самое — запись не перевыпускается");
+    // продление
+    let e2 = Endorsement::issue_for(&k, &own, T0 + 9000);
+    d.set_endorsements(vec![e2.clone()], T0 + 3);
+    assert!(d.own(T0 + 3).seq > first.seq);
+    assert_eq!(d.own(T0 + 3).endorsements, vec![e2]);
+    // поручительство за другой узел отбрасывается; пустой список снимает поручительство
+    let other = SwarmIdentity::from_static_private([2; 32]);
+    let foreign = Endorsement::issue(&k2, &other.static_pub, &other.signing.verifying_key().to_bytes(), T0 + 5000);
+    d.set_endorsements(vec![foreign], T0 + 4);
+    assert!(d.own(T0 + 4).endorsements.is_empty());
+    assert_eq!(d.own(T0 + 4).verify(T0 + 4, true), Ok(()));
+}
+
+/// `<секрет роя>.<доказательство>` обязан влезть в 128 символов поля секрета mesh-токена.
+fn sw_token_len_fits() -> bool {
+    swarm().node_secret(&[0u8; 16]).len() + 1 + pair_proof(&[0u8; 32]).len() <= 128
+}
+
+#[test]
+fn pairwise_secrets_are_symmetric_and_belong_to_exactly_one_pair() {
+    let a = SwarmIdentity::from_static_private([1; 32]);
+    let b = SwarmIdentity::from_static_private([2; 32]);
+    let c = SwarmIdentity::from_static_private([3; 32]);
+    let ab = pairwise_secret(&a.static_private, &b.static_pub);
+    assert_eq!(ab, pairwise_secret(&b.static_private, &a.static_pub), "симметричен");
+    assert_ne!(ab, pairwise_secret(&a.static_private, &c.static_pub));
+    assert_ne!(ab, pairwise_secret(&b.static_private, &c.static_pub));
+    assert_ne!(pair_proof(&ab), pair_proof(&pairwise_secret(&a.static_private, &c.static_pub)));
+    assert_eq!(pair_proof(&ab).len(), 32);
+    assert!(sw_token_len_fits(), "токен умещается в предел поля секрета");
+    // у C (знающего ключ роя) подделать доказательство пары A–B нечем
+    let c_guess = pairwise_secret(&c.static_private, &a.static_pub);
+    assert_ne!(pair_proof(&c_guess), pair_proof(&ab));
+    assert!(ct_eq_str("abc", "abc") && !ct_eq_str("abc", "abd") && !ct_eq_str("abc", "ab"));
+}
+
+#[test]
+fn mesh_admission_binds_known_nodes_to_their_pairwise_proof() {
+    let sw = swarm();
+    let strict = dir_with(1, "10.0.0.1", &sw, |c| c.strict_pairwise = true);
+    let lax = dir_with(1, "10.0.0.1", &sw, |_| {});
+    let a = dir(2, "10.0.1.1", &sw); // известный пир
+    let c = dir(3, "10.0.2.1", &sw); // член роя, которого B ещё не знает
+    for d in [&strict, &lax] {
+        d.insert(a.own(T0), T0);
+    }
+    let a_id = a.node_id_hex();
+    let swarm_part = sw.node_secret(&a.node_id());
+    let proof = a.mesh_secret_for(&strict.node_id(), T0).is_none(); // A не знает B → None
+    assert!(proof);
+    a.insert(strict.own(T0), T0);
+    let good = a.mesh_secret_for(&strict.node_id(), T0).expect("A знает B");
+    assert!(good.starts_with(&swarm_part) && good.contains('.'));
+
+    for d in [&strict, &lax] {
+        // настоящий A
+        assert!(d.validate_mesh_peer_at(&a_id, &good, T0), "A с доказательством");
+        // доказательство, снятое для другой пары (C→B), от имени A не годится
+        c.insert(strict.own(T0), T0);
+        let c_secret = c.mesh_secret_for(&strict.node_id(), T0).unwrap();
+        let c_proof = c_secret.split_once('.').unwrap().1.to_string();
+        assert!(!d.validate_mesh_peer_at(&a_id, &format!("{swarm_part}.{c_proof}"), T0), "чужое доказательство");
+        // испорченное
+        assert!(!d.validate_mesh_peer_at(&a_id, &format!("{swarm_part}.{}", "0".repeat(32)), T0));
+        // секрет роя другого узла + верное доказательство — нет
+        assert!(!d.validate_mesh_peer_at(&a_id, &format!("{}.{}", sw.node_secret(&c.node_id()), good.split_once('.').unwrap().1), T0));
+        // незнакомый член роя — знакомство по ключу роя
+        assert!(d.validate_mesh_peer_at(&c.node_id_hex(), &sw.node_secret(&c.node_id()), T0), "введение");
+    }
+    // самозванец, знающий только ключ роя, выдаёт себя за известного A
+    assert!(!strict.validate_mesh_peer_at(&a_id, &swarm_part, T0), "строгий режим");
+    assert!(lax.validate_mesh_peer_at(&a_id, &swarm_part, T0), "совместимость со старыми узлами");
+}
+
+#[test]
+fn old_nodes_without_the_pairwise_flag_get_the_plain_swarm_secret() {
+    let sw = swarm();
+    let a = dir(1, "10.0.0.1", &sw);
+    let id = SwarmIdentity::from_static_private([2; 32]);
+    let legacy = NodeDescriptor::sign(
+        &id.signing, id.static_pub, Roles(Roles::RELAY), features::GOSSIP /* без PAIRWISE */, (2, 5), 1, T0, 3600,
+        String::new(), vec![Endpoint { kind: EndpointKind::Tcp, host: "10.0.1.1".into(), port: 443 }],
+    );
+    let legacy_id = legacy.node_id;
+    a.insert(legacy, T0);
+    assert_eq!(a.mesh_secret_for(&legacy_id, T0), Some(sw.node_secret(&a.node_id())), "старый узел не знает формата с точкой");
+    assert!(a.mesh_secret_for(&[0u8; 16], T0).is_none(), "об этом узле записи нет");
+}
+
+// ─────────────────────────────── гибрид с панелью ───────────────────────────────
+
+struct MockPanel {
+    peers: Vec<crate::net::MeshPeer>,
+    peers_ok: bool,
+    admits: Vec<(String, String)>,
+}
+
+#[async_trait::async_trait]
+impl crate::net::AuthValidator for MockPanel {
+    async fn validate(&self, _t: &str) -> Result<crate::net::UserQuota, netrunner_logger::AppError> {
+        Ok(crate::net::UserQuota { user_id: "u".into(), limit_bytes: None, used_bytes: 0 })
+    }
+    async fn report_usage(&self, _u: &str, _d: u64) -> Result<crate::net::UsageReport, netrunner_logger::AppError> {
+        Ok(crate::net::UsageReport { used_bytes: 0, limit_bytes: None, over_limit: false })
+    }
+    async fn report_usage_batch(
+        &self,
+        _b: &str,
+        _d: &[crate::net::UsageDelta],
+    ) -> Result<std::collections::HashMap<String, crate::net::UsageReport>, netrunner_logger::AppError> {
+        Ok(Default::default())
+    }
+    async fn report_node_health(&self, _r: crate::net::NodeHealthReport) -> Result<(), netrunner_logger::AppError> {
+        Ok(())
+    }
+    async fn list_mesh_peers(&self) -> Result<Vec<crate::net::MeshPeer>, netrunner_logger::AppError> {
+        if self.peers_ok {
+            Ok(self.peers.clone())
+        } else {
+            Err(netrunner_logger::AppError::new(netrunner_logger::ERR_INFRA_TIMEOUT, "panel", "down"))
+        }
+    }
+    async fn validate_mesh_peer(&self, id: &str, secret: &str) -> Result<(), netrunner_logger::AppError> {
+        if self.admits.iter().any(|(i, s)| i == id && s == secret) {
+            Ok(())
+        } else {
+            Err(netrunner_logger::AppError::new(netrunner_logger::ERR_AUTH_FAILED, "panel", "no"))
+        }
+    }
+}
+
+fn panel_peer(id: &str, host: &str) -> crate::net::MeshPeer {
+    crate::net::MeshPeer {
+        node_id: id.into(),
+        host: host.into(),
+        port: 443,
+        decoy_sni: "panel.example".into(),
+        nrxp_secret: "p".repeat(64),
+        nrxp_static_public: "q".repeat(64),
+    }
+}
+
+#[tokio::test]
+async fn hybrid_merges_panel_and_directory_peers_and_the_panel_wins_conflicts() {
+    use crate::net::AuthValidator;
+    let sw = swarm();
+    let now = unix_now();
+    let node = std::sync::Arc::new(dir(1, "10.0.0.1", &sw));
+    // в каталоге: D (свой адрес) и E (тот же адрес, что у панельного пира)
+    let d = {
+        let id = SwarmIdentity::from_static_private([10; 32]);
+        NodeDescriptor::sign(&id.signing, id.static_pub, Roles(Roles::RELAY), 3, (2, 6), 1, now, 3600, String::new(),
+            vec![Endpoint { kind: EndpointKind::Tcp, host: "10.9.0.1".into(), port: 443 }])
+    };
+    let e = {
+        let id = SwarmIdentity::from_static_private([11; 32]);
+        NodeDescriptor::sign(&id.signing, id.static_pub, Roles(Roles::RELAY), 3, (2, 6), 1, now, 3600, String::new(),
+            vec![Endpoint { kind: EndpointKind::Tcp, host: "10.9.1.1".into(), port: 443 }])
+    };
+    node.insert(d.clone(), now);
+    node.insert(e.clone(), now);
+
+    let panel = std::sync::Arc::new(MockPanel {
+        peers: vec![panel_peer("panel-uuid-1", "10.9.1.1")],
+        peers_ok: true,
+        admits: vec![("panel-uuid-1".into(), "internal".into())],
+    });
+    let hybrid = DirectoryValidator::new(node.clone(), Some(panel.clone()));
+    let peers = hybrid.list_mesh_peers().await.unwrap();
+    let ids: Vec<&str> = peers.iter().map(|p| p.node_id.as_str()).collect();
+    assert_eq!(peers.len(), 2, "{ids:?}");
+    assert_eq!(peers[0].node_id, "panel-uuid-1", "панель первой");
+    assert!(ids.contains(&node_id_hex(&d.node_id).as_str()));
+    assert!(!ids.contains(&node_id_hex(&e.node_id).as_str()), "E с адресом панельного пира — побеждает панель");
+
+    // панель недоступна — каталог продолжает работать
+    let down = DirectoryValidator::new(node.clone(), Some(std::sync::Arc::new(MockPanel { peers: vec![], peers_ok: false, admits: vec![] })));
+    assert_eq!(down.list_mesh_peers().await.unwrap().len(), 2, "D и E из каталога");
+
+    // без панели — только каталог
+    let alone = DirectoryValidator::new(node.clone(), None);
+    assert_eq!(alone.list_mesh_peers().await.unwrap().len(), 2);
+
+    // допуск: «или»
+    assert!(hybrid.validate_mesh_peer("panel-uuid-1", "internal").await.is_ok(), "панель подтвердила");
+    assert!(hybrid.validate_mesh_peer("panel-uuid-1", "wrong").await.is_err());
+    let member = node_id_hex(&d.node_id);
+    assert!(hybrid.validate_mesh_peer(&member, &sw.node_secret(&d.node_id)).await.is_ok(), "член роя");
+    assert!(hybrid.validate_mesh_peer(&member, "nope").await.is_err());
+    // пользователи — из панели
+    assert!(hybrid.validate("jwt").await.is_ok());
+    assert!(alone.validate("jwt").await.is_err());
 }
