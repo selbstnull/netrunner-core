@@ -50,6 +50,19 @@ impl Drop for StreamGuard {
     }
 }
 
+/// How a socket error ended a bridged stream, for the stream summary (`end`).
+/// A reset from the destination and a plain failure look alike in `closed`
+/// otherwise; this is what tells "the site tore the connection down" apart.
+fn io_end_kind(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind::*;
+    match error.kind() {
+        ConnectionReset | ConnectionAborted => "dest_reset",
+        BrokenPipe => "dest_broken_pipe",
+        TimedOut => "dest_timeout",
+        _ => "dest_error",
+    }
+}
+
 /// TCP-мост: гоняет данные между потоком туннеля и TCP-сокетом цели.
 ///
 /// upload и download крутятся конкурентно; завершение любой половины через
@@ -96,7 +109,14 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                     biased;
                     _ = token.cancelled() => break,
                     res = reader.read_buf(&mut buf) => match res {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => {
+                            muxer.trace_end(stream_id, "dest_fin");
+                            break;
+                        }
+                        Err(error) => {
+                            muxer.trace_end(stream_id, io_end_kind(&error));
+                            break;
+                        }
                         Ok(_) => {
                             let data = buf.split().freeze();
                             // 🔥 GRACEFUL PAUSE (anti-domino).
@@ -115,6 +135,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                                 }
                                 if Instant::now() >= deadline {
                                     warn!(stream_id, "Stream pause budget exceeded — no leg recovered, closing");
+                                    muxer.trace_end(stream_id, "legs_down");
                                     break;
                                 }
                                 tokio::select! {
@@ -140,6 +161,7 @@ pub(crate) async fn run_tcp_bridge<R, W>(
     // the same tunnel leg.
     let download = {
         let token = token.clone();
+        let muxer = muxer.clone();
         async move {
             let mut writer = writer;
             let mut v_rx = v_rx;
@@ -148,7 +170,10 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                     biased;
                     _ = token.cancelled() => break,
                     maybe_data = v_rx.recv() => match maybe_data {
-                        None => break,
+                        None => {
+                            muxer.trace_end(stream_id, "tunnel_closed");
+                            break;
+                        }
                         Some(data) => {
                             if data.is_empty() { continue; }
                             // Adaptive: BRIDGE_STREAM_WRITE_TIMEOUT is the floor, but
@@ -157,7 +182,14 @@ pub(crate) async fn run_tcp_bridge<R, W>(
                             let write_timeout = adaptive_write_timeout(BRIDGE_STREAM_WRITE_TIMEOUT);
                             match timeout(write_timeout, writer.write_all(&data)).await {
                                 Ok(Ok(_)) => {}
-                                _ => break,
+                                Ok(Err(error)) => {
+                                    muxer.trace_end(stream_id, io_end_kind(&error));
+                                    break;
+                                }
+                                Err(_) => {
+                                    muxer.trace_end(stream_id, "write_timeout");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -252,4 +284,19 @@ pub(crate) async fn run_udp_bridge(
     }
 
     debug!(stream_id, "🔌 UDP Bridge closed");
+}
+
+#[cfg(test)]
+mod end_kind_tests {
+    use super::io_end_kind;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_reset_is_told_apart_from_other_failures() {
+        assert_eq!(io_end_kind(&Error::from(ErrorKind::ConnectionReset)), "dest_reset");
+        assert_eq!(io_end_kind(&Error::from(ErrorKind::ConnectionAborted)), "dest_reset");
+        assert_eq!(io_end_kind(&Error::from(ErrorKind::BrokenPipe)), "dest_broken_pipe");
+        assert_eq!(io_end_kind(&Error::from(ErrorKind::TimedOut)), "dest_timeout");
+        assert_eq!(io_end_kind(&Error::from(ErrorKind::Other)), "dest_error");
+    }
 }

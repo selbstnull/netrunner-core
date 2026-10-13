@@ -26,6 +26,8 @@ use crate::net::trace::{DialKind, Family};
 
 /// Resolution budget, as before.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A dial slower than this is logged (resolve + connect time only, no target).
+const SLOW_DIAL: Duration = Duration::from_millis(800);
 /// Head start given to an attempt before the next address is raced against it.
 const STAGGER: Duration = Duration::from_millis(250);
 
@@ -108,6 +110,9 @@ pub(crate) async fn connect_tcp(
 ) -> Result<(TcpStream, Family), DialKind> {
     let started = Instant::now();
     let addrs = resolve(target).await?;
+    let resolved = started.elapsed();
+    metrics::histogram!("netrunner_dial_resolve_seconds").record(resolved.as_secs_f64());
+    let candidates = addrs.len();
     let deadline = started + total;
 
     let mut attempts: JoinSet<(Family, io::Result<TcpStream>)> = JoinSet::new();
@@ -141,6 +146,24 @@ pub(crate) async fn connect_tcp(
         tokio::select! {
             joined = attempts.join_next() => match joined {
                 Some(Ok((family, Ok(stream)))) => {
+                    // Where an exit's time to a destination goes: name resolution
+                    // versus the TCP handshake (a lost SYN shows up as ~1 s / ~3 s).
+                    let connected = started.elapsed().saturating_sub(resolved);
+                    metrics::histogram!(
+                        "netrunner_dial_connect_seconds", "family" => family.as_str()
+                    )
+                    .record(connected.as_secs_f64());
+                    if resolved + connected >= SLOW_DIAL {
+                        tracing::warn!(
+                            target: "netrunner_tunnel",
+                            resolve_ms = resolved.as_millis() as u64,
+                            connect_ms = connected.as_millis() as u64,
+                            family = family.as_str(),
+                            candidates,
+                            attempts = launched,
+                            "slow dial"
+                        );
+                    }
                     if launched > 1 {
                         metrics::counter!(
                             "netrunner_dial_race_won_total", "family" => family.as_str()

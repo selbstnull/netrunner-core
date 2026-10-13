@@ -211,6 +211,10 @@ struct CreditState {
     created_ms: u64,
     /// Wall-clock ms of the first Data byte sent down this stream (0 = none yet).
     first_down_ms: AtomicU64,
+    /// Wall-clock ms the first byte FROM the peer arrived for this stream (0 = none
+    /// yet): with `first_down_ms` it tells "the client/route was late with its first
+    /// bytes" from "the destination or the way back was late".
+    first_up_ms: AtomicU64,
     /// Datagram bytes sent down this stream. `sent` only counts credit-gated
     /// `Data`, so without this a UDP flow always reported 0 bytes back.
     udp_down_bytes: AtomicU64,
@@ -232,6 +236,7 @@ impl CreditState {
             closed: AtomicBool::new(false),
             created_ms: now,
             first_down_ms: AtomicU64::new(0),
+            first_up_ms: AtomicU64::new(0),
             udp_down_bytes: AtomicU64::new(0),
             stall_ms: AtomicU64::new(0),
             stalls: AtomicU32::new(0),
@@ -2189,6 +2194,13 @@ impl Muxer {
         }
     }
 
+    /// Records which side ended a bridged stream and how (see `StreamTrace::end`).
+    pub fn trace_end(&self, stream_id: u32, end: &'static str) {
+        if let Some(mut entry) = self.traces.get_mut(&stream_id) {
+            entry.trace.end.get_or_insert(end);
+        }
+    }
+
     /// A dial attempt failed with `kind`: counts it and remembers the latest kind.
     pub fn trace_dial_failure(&self, stream_id: u32, kind: DialKind) {
         if let Some(mut entry) = self.traces.get_mut(&stream_id) {
@@ -2210,6 +2222,11 @@ impl Muxer {
         if first != 0 {
             entry.trace.first_byte_ms = Some(first.saturating_sub(entry.credit.created_ms));
         }
+        let first_up = entry.credit.first_up_ms.load(Ordering::Relaxed);
+        if first_up != 0 {
+            entry.trace.first_up_ms = Some(first_up.saturating_sub(entry.credit.created_ms));
+        }
+        entry.trace.leg = self.stream_bindings.get(&stream_id).map(|leg| *leg);
         let totals = StreamTotals {
             up_bytes: entry.stats.rx_bytes.load(Ordering::Relaxed),
             down_bytes: entry.credit.sent.load(Ordering::Relaxed)
@@ -2353,6 +2370,16 @@ impl Muxer {
 
     pub fn dispatch_to_local(&self, stream_id: u32, data: Bytes) {
         let size = data.len() as u64;
+        if let Some(entry) = self.traces.get(&stream_id) {
+            if entry.credit.first_up_ms.load(Ordering::Relaxed) == 0 {
+                let _ = entry.credit.first_up_ms.compare_exchange(
+                    0,
+                    diagnostics::current_timestamp_ms(),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+        }
 
         let Some((tx, stats, backlog)) = self.streams.get(&stream_id).map(|entry| {
             let slot = entry.value();

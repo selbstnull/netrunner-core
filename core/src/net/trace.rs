@@ -160,11 +160,20 @@ pub struct StreamTrace {
     pub strong_privacy: bool,
     /// Why/how it ended; first writer wins, `None` means a plain close.
     pub outcome: Option<&'static str>,
+    /// Which side ended a stream that was bridged on this node and how: the
+    /// destination closing (`dest_fin`), resetting (`dest_reset`), timing out or
+    /// failing otherwise, or the tunnel/client side ending it. First writer wins.
+    pub end: Option<&'static str>,
     pub dial_kind: Option<DialKind>,
     /// Exit attempts made (primary + failovers).
     pub attempts: u8,
     /// Milliseconds from open to the first byte coming back, if any did.
     pub first_byte_ms: Option<u64>,
+    /// Milliseconds from open to the first byte arriving from the peer (client side
+    /// of the stream), if any did.
+    pub first_up_ms: Option<u64>,
+    /// Leg this stream was bound to when it ended (the way its answer went back).
+    pub leg: Option<u32>,
     /// Keyed, daily-rotating tag of the destination host name (see [`name_tag`]).
     /// Only ever printed for streams that failed.
     pub name_tag: Option<String>,
@@ -179,9 +188,12 @@ impl StreamTrace {
             route: Route::Pending,
             strong_privacy,
             outcome: None,
+            end: None,
             dial_kind: None,
             attempts: 0,
             first_byte_ms: None,
+            first_up_ms: None,
+            leg: None,
             name_tag: None,
         }
     }
@@ -219,6 +231,10 @@ pub fn emit_stream_closed(session_id: &str, stream_id: u32, trace: &StreamTrace,
         metrics::counter!("netrunner_stream_credit_stalled_total").increment(1);
     }
 
+    let end = trace.end.unwrap_or("-");
+    if trace.end.is_some() {
+        metrics::counter!("netrunner_stream_end_total", "proto" => proto, "end" => end).increment(1);
+    }
     let failed = !matches!(outcome, "closed" | "ok");
     let line = |level_warn: bool| {
         if level_warn {
@@ -230,11 +246,14 @@ pub fn emit_stream_closed(session_id: &str, stream_id: u32, trace: &StreamTrace,
                 family,
                 route,
                 outcome,
+                end,
                 dial = trace.dial_kind.map(DialKind::as_str).unwrap_or("-"),
                 attempts = trace.attempts,
                 strong_privacy = trace.strong_privacy,
                 duration_ms,
                 first_byte_ms = trace.first_byte_ms.map(|v| v as i64).unwrap_or(-1),
+                first_up_ms = trace.first_up_ms.map(|v| v as i64).unwrap_or(-1),
+                leg = trace.leg.map(|v| v as i64).unwrap_or(-1),
                 up_bytes = totals.up_bytes,
                 down_bytes = totals.down_bytes,
                 credit_stall_ms = totals.credit_stall_ms,
@@ -251,11 +270,14 @@ pub fn emit_stream_closed(session_id: &str, stream_id: u32, trace: &StreamTrace,
                 family,
                 route,
                 outcome,
+                end,
                 dial = trace.dial_kind.map(DialKind::as_str).unwrap_or("-"),
                 attempts = trace.attempts,
                 strong_privacy = trace.strong_privacy,
                 duration_ms,
                 first_byte_ms = trace.first_byte_ms.map(|v| v as i64).unwrap_or(-1),
+                first_up_ms = trace.first_up_ms.map(|v| v as i64).unwrap_or(-1),
+                leg = trace.leg.map(|v| v as i64).unwrap_or(-1),
                 up_bytes = totals.up_bytes,
                 down_bytes = totals.down_bytes,
                 credit_stall_ms = totals.credit_stall_ms,

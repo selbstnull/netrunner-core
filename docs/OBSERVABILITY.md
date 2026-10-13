@@ -22,9 +22,11 @@ Emitted exactly once when a stream a client opened through this node goes away.
 | `outcome` | `closed` (normal) or the reason: `dial_failed`, `egress_exhausted`, `no_egress_candidate`, `route_setup_deadline`, `route_rejected`, `rejected*`, `refused_*`, `cancelled` |
 | `dial` | last dial failure kind: `net_unreachable`, `host_unreachable`, `refused`, `timeout`, `resolve`, `bind`, `blocked` (CGNAT/benchmark space, never dialed), `other`, or `-` |
 | `attempts` | exit attempts (primary + failovers) |
-| `duration_ms`, `first_byte_ms` | lifetime; time to the first byte sent back (`-1` = none) |
+| `duration_ms`, `first_byte_ms`, `first_up_ms` | lifetime; time to the first byte sent back; time to the first byte received from the peer (`-1` = none). A slow `first_byte_ms` with a small `first_up_ms` means the destination or the way back was slow; a `first_up_ms` as large as `first_byte_ms` means the client or the route was late with its first bytes |
+| `leg` | leg the stream was bound to (`-1` = none): lets a slow stream be matched with that leg's retransmits |
 | `up_bytes`, `down_bytes` | client→destination / destination→client (TCP and UDP datagrams) |
 | `credit_stall_ms`, `credit_stalls` | time the sender sat blocked on the client's flow-control window |
+| `end` | on a stream this node bridged to the destination: who ended it first and how — `dest_fin` (the site closed cleanly), `dest_reset` / `dest_broken_pipe` / `dest_timeout` / `dest_error` (the site's connection failed), `tunnel_closed` (the client/other side closed it), `write_timeout`, `legs_down`; `-` when this node only relayed the stream |
 | `name_tag` | on failed streams with a host-name target only: keyed, daily-rotating tag of the host (see below), `-` otherwise |
 
 Reading it: a video that "hangs" shows up as a long `duration_ms` with a large
@@ -48,8 +50,10 @@ kind.
 ## Metrics
 
 * `netrunner_stream_closed_total{proto,family,route,outcome}`
+* `netrunner_stream_end_total{proto,end}`
 * `netrunner_stream_duration_seconds{proto,outcome}`, `netrunner_stream_credit_stalled_total`
 * `netrunner_egress_dial_fail_total{proto,family,kind}` — per failed dial
+* `netrunner_dial_resolve_seconds`, `netrunner_dial_connect_seconds{family}` — where an exit's time to a destination goes; a dial over 0.8 s also logs `slow dial` (`resolve_ms`, `connect_ms`, `candidates`, `attempts`)
 * `netrunner_dial_race_won_total{family}` — a later address won the Happy Eyeballs race
 * `netrunner_credit_stall_seconds`, `netrunner_credit_probe_total`
 * `netrunner_leg_closed_total{reason}`, `netrunner_leg_engine_failure_total`
