@@ -5,6 +5,11 @@ Client (Linux/OpenWrt/Android via UniFFI) + server node.
 
 🇷🇺 [Русская версия](README.md) · Detailed documents: `docs/en/` (English); `docs/MAINTENANCE.md`, `docs/PROTOCOL_ANALYSIS.md`, `docs/UDP_LEG_RESEARCH.md` are Russian only.
 
+> **💛 Support Netrunner Core.** The core is developed independently and relies on donations, not on revenue from the commercial product. If it is useful to you, please support it.
+> USDT (TRC-20): `TQbts9Bj1LZJQE8oGbSbo1Qg6R3Co2k8jX` ([details](DONATE.md))
+>
+> <img src=".github/donate-usdt-trc20.png" alt="USDT TRC-20 QR code" width="140">
+
 **Features**
 
 - up to 4 parallel TCP "legs" per session, seamless stream failover;

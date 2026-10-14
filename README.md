@@ -5,6 +5,11 @@ Chrome). Клиент (Linux/OpenWrt/Android через UniFFI) + серверн
 
 🇬🇧 [English version](README.en.md)
 
+> **💛 Поддержать Netrunner Core.** Ядро развивается независимо и держится на пожертвованиях, а не на доходе от коммерческого продукта. Если оно вам полезно, поддержите проект.
+> USDT (TRC-20): `TQbts9Bj1LZJQE8oGbSbo1Qg6R3Co2k8jX` ([подробнее](DONATE.md))
+>
+> <img src=".github/donate-usdt-trc20.png" alt="QR-код USDT TRC-20" width="140">
+
 **Возможности**
 
 - до 4 параллельных TCP-«ног» на сессию, бесшовный переезд потоков при обрыве ноги;
