@@ -556,6 +556,9 @@ pub struct Muxer {
     /// прокси-серверу (`None` — авторизация выключена или это клиентская
     /// сторона муксера, отчёты о трафике шлёт только сервер).
     quota_user_id: Arc<ArcSwap<Option<String>>>,
+    /// Политика доступа к назначениям этого юзера (сотрудник организации);
+    /// `None` — без ограничений. Ставится вместе с `quota_user_id`.
+    access_policy: Arc<ArcSwap<Option<Arc<crate::net::access_policy::AccessPolicy>>>>,
     /// Сколько байт (tx+rx) уже было отчитано бэкенду по этой сессии —
     /// следующий тик репортит только дельту сверх этого значения.
     quota_reported_bytes: Arc<AtomicU64>,
@@ -643,6 +646,7 @@ impl Muxer {
             cumulative_tx: Arc::new(AtomicU64::new(0)),
             cumulative_rx: Arc::new(AtomicU64::new(0)),
             quota_user_id: Arc::new(ArcSwap::from_pointee(None)),
+            access_policy: Arc::new(ArcSwap::from_pointee(None)),
             quota_reported_bytes: Arc::new(AtomicU64::new(0)),
             fatal: Arc::new(AtomicBool::new(false)),
             network_epoch: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
@@ -742,6 +746,17 @@ impl Muxer {
     /// проверке auth-токена первой ноги сессии (см. `ServerHandler::run`).
     pub fn set_quota_user(&self, user_id: String) {
         self.quota_user_id.store(Arc::new(Some(user_id)));
+    }
+
+    pub fn set_access_policy(
+        &self,
+        policy: Option<Arc<crate::net::access_policy::AccessPolicy>>,
+    ) {
+        self.access_policy.store(Arc::new(policy));
+    }
+
+    pub(crate) fn access_policy(&self) -> Option<Arc<crate::net::access_policy::AccessPolicy>> {
+        self.access_policy.load_full().as_ref().clone()
     }
 
     pub fn quota_user_id(&self) -> Option<String> {

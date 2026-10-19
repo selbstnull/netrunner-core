@@ -22,6 +22,7 @@ mod dial;
 mod engine;
 mod handler;
 mod muxer;
+mod policy_gate;
 mod reverse_egress;
 
 pub use buftune::BUF_CAP;

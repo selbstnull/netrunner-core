@@ -128,6 +128,10 @@ struct ValidateResponse {
     user_id: String,
     limit_bytes: Option<u64>,
     used_bytes: u64,
+    /// Только для сотрудников организации (бэкенд, миграция 0071+). Старый
+    /// бэкенд поля не шлёт — тогда `None` и поведение прежнее.
+    #[serde(default)]
+    access_policy: Option<netrunner_core::net::access_policy::AccessPolicyDto>,
 }
 
 #[derive(Serialize)]
@@ -239,10 +243,70 @@ impl AuthValidator for BackendClient {
             user_id: body.user_id,
             limit_bytes: body.limit_bytes,
             used_bytes: body.used_bytes,
+            access_policy: body.access_policy.as_ref().map(|dto| {
+                std::sync::Arc::new(netrunner_core::net::access_policy::AccessPolicy::from_dto(dto))
+            }),
+            exit_label: None,
         };
         self.validate_cache
             .insert(token.to_string(), (quota.clone(), Instant::now()));
         Ok(quota)
+    }
+
+    /// Токен коннектора организации. Отдельная ручка бэкенда, а не
+    /// `/internal/validate`: клиентский JWT роль выхода не даёт, а токен
+    /// коннектора не должен проходить как пользовательский. Не кэшируется —
+    /// проверка раз на сессию коннектора, а отзыв должен действовать сразу.
+    async fn validate_egress(&self, token: &str) -> Result<UserQuota, AppError> {
+        if token.is_empty() || self.circuit.is_open() {
+            return Err(AppError::new(
+                netrunner_logger::ERR_AUTH_FAILED,
+                "Доступ запрещен",
+                "Empty connector token or backend unavailable",
+            ));
+        }
+        let resp = self
+            .http
+            .post(format!("{}/api/v1/internal/validate-connector", self.base_url))
+            .header("X-Internal-Secret", &self.internal_secret)
+            .json(&ValidateRequest { token })
+            .send()
+            .await
+            .map_err(|e| {
+                self.circuit.record_failure();
+                AppError::new(
+                    netrunner_logger::ERR_INFRA_TIMEOUT,
+                    "Бэкенд недоступен",
+                    e.to_string(),
+                )
+            })?;
+        if resp.status().is_server_error() {
+            self.circuit.record_failure();
+        }
+        if !resp.status().is_success() {
+            metrics::counter!("netrunner_auth_failures_total").increment(1);
+            return Err(AppError::new(
+                netrunner_logger::ERR_AUTH_FAILED,
+                "Доступ запрещен",
+                format!("Backend rejected connector token: HTTP {}", resp.status()),
+            ));
+        }
+        let body: ValidateResponse = resp.json().await.map_err(|e| {
+            AppError::new(
+                netrunner_logger::ERR_INFRA_TIMEOUT,
+                "Ошибка бэкенда",
+                e.to_string(),
+            )
+        })?;
+        self.circuit.record_success();
+        Ok(UserQuota {
+            // Метку выхода назначает бэкенд (id коннектора), а не набравший.
+            exit_label: Some(body.user_id.clone()),
+            user_id: body.user_id,
+            limit_bytes: None,
+            used_bytes: 0,
+            access_policy: None,
+        })
     }
 
     async fn report_usage(&self, user_id: &str, delta_bytes: u64) -> Result<UsageReport, AppError> {

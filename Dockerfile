@@ -36,6 +36,8 @@ RUN apt-get update && apt-get install -y ca-certificates libssl3 tini wget && rm
 
 COPY --from=builder /app/target/release/netrunner-server /app/netrunner-proxy
 COPY --from=builder /app/target/release/netrunner-masque-edge /app/netrunner-masque-edge
+# Коннектор организации (`docker run ... netrunner-proxy ./netrunner-connector`).
+COPY --from=builder /app/target/release/netrunner-connector /app/netrunner-connector
 COPY --chmod=0755 server/container-entrypoint.sh /app/container-entrypoint.sh
 COPY --chmod=0644 server/masque-bind.sh /app/masque-bind.sh
 

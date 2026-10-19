@@ -997,7 +997,7 @@ struct MockPanel {
 #[async_trait::async_trait]
 impl crate::net::AuthValidator for MockPanel {
     async fn validate(&self, _t: &str) -> Result<crate::net::UserQuota, netrunner_logger::AppError> {
-        Ok(crate::net::UserQuota { user_id: "u".into(), limit_bytes: None, used_bytes: 0 })
+        Ok(crate::net::UserQuota { user_id: "u".into(), limit_bytes: None, used_bytes: 0, access_policy: None, exit_label: None })
     }
     async fn report_usage(&self, _u: &str, _d: u64) -> Result<crate::net::UsageReport, netrunner_logger::AppError> {
         Ok(crate::net::UsageReport { used_bytes: 0, limit_bytes: None, over_limit: false })

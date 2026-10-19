@@ -114,6 +114,9 @@ pub struct Network {
     /// Число реально обслуживаемых физических соединений — общий счётчик для
     /// `/health` и панели управления.
     active_connections: Arc<AtomicU64>,
+    /// Реестр коннекторов организации (`--connectors`). `None` — нода не
+    /// принимает `egress:`-токены вообще.
+    reverse_egress: Option<Arc<netrunner_core::net::ReverseEgressRegistry>>,
 }
 
 impl Network {
@@ -165,7 +168,18 @@ impl Network {
             gossip_interval_secs: 15,
             endorsement_sources: Vec::new(),
             active_connections: Arc::new(AtomicU64::new(0)),
+            reverse_egress: None,
         }
+    }
+
+    /// Принимать коннекторы организации (узлы, сами набирающие эту ноду и
+    /// открывающие потоки изнутри внутренней сети клиента).
+    pub fn with_connectors(
+        mut self,
+        registry: Arc<netrunner_core::net::ReverseEgressRegistry>,
+    ) -> Self {
+        self.reverse_egress = Some(registry);
+        self
     }
 
     /// Счётчик активных соединений (для панели управления).
@@ -609,6 +623,10 @@ impl Network {
                             self.mesh_enabled,
                             self.mesh.clone(),
                         );
+                        let handler = match &self.reverse_egress {
+                            Some(registry) => handler.with_reverse_egress(registry.clone()),
+                            None => handler,
+                        };
 
                         let active_now = active_connections.fetch_add(1, Ordering::Relaxed) + 1;
                         metrics::gauge!("netrunner_connections_active").set(active_now as f64);

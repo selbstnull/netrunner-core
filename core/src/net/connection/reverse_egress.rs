@@ -211,7 +211,7 @@ impl ReverseEgressRegistry {
     }
 
     /// The most recent usable session with this label.
-    fn pick_labeled(&self, label: &str) -> Option<Arc<MeshPeerSession>> {
+    pub(crate) fn pick_labeled(&self, label: &str) -> Option<Arc<MeshPeerSession>> {
         self.inner
             .lock()
             .unwrap()

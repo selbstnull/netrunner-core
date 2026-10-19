@@ -3124,8 +3124,13 @@ impl TunnelHandler for ServerHandler {
             Ok(None)
         };
 
+        let mut validated_exit_label: Option<String> = None;
         match auth_result {
-            Ok(Some(quota)) => muxer.set_quota_user(quota.user_id),
+            Ok(Some(quota)) => {
+                validated_exit_label = quota.exit_label.clone();
+                muxer.set_access_policy(quota.access_policy.clone());
+                muxer.set_quota_user(quota.user_id)
+            }
             Ok(None) => {}
             Err(e) => {
                 // Не дублируем счётчик — `BackendClient::validate` (см.
@@ -3230,7 +3235,9 @@ impl TunnelHandler for ServerHandler {
         {
             registry.register(
                 &session_id,
-                label,
+                // Метку назначает валидатор, если он умеет (бэкенд — по id
+                // коннектора); заявленная набравшим — лишь запасной вариант.
+                validated_exit_label.as_deref().unwrap_or(label),
                 Arc::new(MeshPeerSession::for_reverse_egress(muxer.clone())),
             );
         }
@@ -3745,6 +3752,8 @@ mod tests {
                 user_id: _token.into(),
                 limit_bytes: None,
                 used_bytes: 0,
+                access_policy: None,
+                exit_label: None,
             })
         }
         async fn report_usage(
@@ -4406,14 +4415,90 @@ mod tests {
     async fn spawn_ingress_with_registry(
         registry: Arc<crate::net::ReverseEgressRegistry>,
     ) -> std::net::SocketAddr {
-        NetworkConfig::init_global(1500);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let sm = Arc::new(SessionManager::new());
         let validator = Arc::new(CountingValidator {
             reject: false,
             calls: Default::default(),
         });
+        spawn_ingress_with_validator(registry, validator).await
+    }
+
+    /// Клиентам этого ingress валидатор выдаёт политику доступа; токен
+    /// выхода (`validate_egress`) проходит без политики.
+    struct PolicyValidator(Arc<crate::net::access_policy::AccessPolicy>);
+
+    #[async_trait::async_trait]
+    impl crate::net::AuthValidator for PolicyValidator {
+        async fn validate_egress(&self, token: &str) -> Result<crate::net::UserQuota, AppError> {
+            Ok(crate::net::UserQuota {
+                user_id: token.into(),
+                limit_bytes: None,
+                used_bytes: 0,
+                access_policy: None,
+                exit_label: None,
+            })
+        }
+        async fn validate(&self, token: &str) -> Result<crate::net::UserQuota, AppError> {
+            Ok(crate::net::UserQuota {
+                user_id: token.into(),
+                limit_bytes: None,
+                used_bytes: 0,
+                access_policy: Some(self.0.clone()),
+                exit_label: None,
+            })
+        }
+        async fn report_usage(
+            &self,
+            _user_id: &str,
+            _delta_bytes: u64,
+        ) -> Result<crate::net::UsageReport, AppError> {
+            Ok(crate::net::UsageReport { used_bytes: 0, limit_bytes: None, over_limit: false })
+        }
+        async fn report_usage_batch(
+            &self,
+            _batch_id: &str,
+            _deltas: &[crate::net::UsageDelta],
+        ) -> Result<std::collections::HashMap<String, crate::net::UsageReport>, AppError> {
+            Ok(Default::default())
+        }
+        async fn report_node_health(
+            &self,
+            _report: crate::net::NodeHealthReport,
+        ) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    fn policy_with(
+        default_deny: bool,
+        allow: Vec<crate::net::access_policy::RuleDto>,
+    ) -> Arc<crate::net::access_policy::AccessPolicy> {
+        Arc::new(crate::net::access_policy::AccessPolicy::from_dto(
+            &crate::net::access_policy::AccessPolicyDto {
+                default_deny,
+                allow,
+                deny: vec![],
+            },
+        ))
+    }
+
+    fn loopback_rule(via: Option<&str>) -> crate::net::access_policy::RuleDto {
+        crate::net::access_policy::RuleDto {
+            kind: "cidr".into(),
+            value: "127.0.0.0/8".into(),
+            ports: vec![],
+            protocol: "tcp".into(),
+            via: via.map(str::to_string),
+        }
+    }
+
+    async fn spawn_ingress_with_validator(
+        registry: Arc<crate::net::ReverseEgressRegistry>,
+        validator: Arc<dyn crate::net::AuthValidator>,
+    ) -> std::net::SocketAddr {
+        NetworkConfig::init_global(1500);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sm = Arc::new(SessionManager::new());
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
@@ -4421,7 +4506,7 @@ mod tests {
                     Connection::new(stream),
                     sm.clone(),
                     Arc::from("example.com"),
-                    Some(validator.clone() as Arc<dyn crate::net::AuthValidator>),
+                    Some(validator.clone()),
                     None,
                     crate::decoy::CoverFlight::node_default().records.into(),
                     true,
@@ -4512,6 +4597,169 @@ mod tests {
         let (got, closed) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
         assert_eq!(got, TOTAL, "all bytes must arrive through the reverse egress");
         assert!(closed);
+    }
+
+    async fn connected_connector(
+        addr: std::net::SocketAddr,
+        registry: &Arc<crate::net::ReverseEgressRegistry>,
+        label: &str,
+    ) -> Arc<Muxer> {
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            label,
+            None,
+            crate::net::EgressPolicy {
+                allow_private: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        wait_for_legs(&egress).await;
+        for _ in 0..100 {
+            if registry.live().contains(&label.to_string()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        egress
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resource_behind_a_connector_is_reached_only_through_it() {
+        use crate::net::{ExitMode, ReverseEgressRegistry};
+        const TOTAL: usize = 256 * 1024;
+        // Режим реестра — Local: сам по себе трафик через коннектор не идёт.
+        // Через него идёт ровно то, что политика пометила `via`.
+        let registry = ReverseEgressRegistry::new(ExitMode::Local);
+        let policy = policy_with(true, vec![loopback_rule(Some("home"))]);
+        let addr = spawn_ingress_with_validator(registry.clone(), Arc::new(PolicyValidator(policy))).await;
+        let target = spawn_burst_target(TOTAL, 64 * 1024).await;
+        let _connector = connected_connector(addr, &registry, "home").await;
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, closed) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, TOTAL);
+        assert!(closed);
+    }
+
+    /// Выход регистрируется под меткой валидатора, а не под заявленной
+    /// набравшим: иначе владелец одного коннектора перехватывал бы чужие потоки.
+    struct LabelingValidator;
+
+    #[async_trait::async_trait]
+    impl crate::net::AuthValidator for LabelingValidator {
+        async fn validate_egress(&self, token: &str) -> Result<crate::net::UserQuota, AppError> {
+            Ok(crate::net::UserQuota {
+                user_id: token.into(),
+                limit_bytes: None,
+                used_bytes: 0,
+                access_policy: None,
+                exit_label: Some("assigned-by-backend".into()),
+            })
+        }
+        async fn validate(&self, token: &str) -> Result<crate::net::UserQuota, AppError> {
+            self.validate_egress(token).await
+        }
+        async fn report_usage(&self, _u: &str, _d: u64) -> Result<crate::net::UsageReport, AppError> {
+            Ok(crate::net::UsageReport { used_bytes: 0, limit_bytes: None, over_limit: false })
+        }
+        async fn report_usage_batch(
+            &self,
+            _b: &str,
+            _d: &[crate::net::UsageDelta],
+        ) -> Result<std::collections::HashMap<String, crate::net::UsageReport>, AppError> {
+            Ok(Default::default())
+        }
+        async fn report_node_health(&self, _r: crate::net::NodeHealthReport) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connector_cannot_impersonate_another_connectors_label() {
+        use crate::net::{ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Local);
+        let addr = spawn_ingress_with_validator(registry.clone(), Arc::new(LabelingValidator)).await;
+        // Набравший называет себя чужой меткой.
+        let egress = ClientHandler::connect_egress(
+            &addr.to_string(),
+            "example.com",
+            Some("jwt".into()),
+            "victim-connector",
+            None,
+            crate::net::EgressPolicy::default(),
+        )
+        .await
+        .unwrap();
+        wait_for_legs(&egress).await;
+        for _ in 0..100 {
+            if !registry.live().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(registry.live(), vec!["assigned-by-backend".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connector_resource_never_falls_back_to_the_node() {
+        use crate::net::{ExitMode, ReverseEgressRegistry};
+        // Цель достижима и с самой ноды (loopback) — именно поэтому проверка
+        // честная: без коннектора поток обязан быть закрыт, а не уйти напрямую.
+        let registry = ReverseEgressRegistry::new(ExitMode::Local);
+        let policy = policy_with(true, vec![loopback_rule(Some("home"))]);
+        let addr = spawn_ingress_with_validator(registry.clone(), Arc::new(PolicyValidator(policy))).await;
+        let target = spawn_burst_target(4096, 1024).await;
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, closed) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, 0, "no connector connected: nothing may leave the node");
+        assert!(closed);
+
+        // Подключился другой коннектор (чужая метка) — это не тот, что назначен.
+        let _other = connected_connector(addr, &registry, "elsewhere").await;
+        let (client2, to_tunnel2, mut from_tunnel2) = connect_client_raw(addr).await;
+        wait_for_legs(&client2).await;
+        let (got, closed) = fetch_via_client(&to_tunnel2, &mut from_tunnel2, target).await;
+        assert_eq!(got, 0, "a connector with another label must not carry the flow");
+        assert!(closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn access_policy_blocks_destinations_that_were_not_granted() {
+        use crate::net::{ExitMode, ReverseEgressRegistry};
+        // Выдана только другая подсеть — loopback-цель закрыта по умолчанию.
+        let registry = ReverseEgressRegistry::new(ExitMode::Local);
+        let mut granted = loopback_rule(None);
+        granted.value = "10.0.0.0/8".into();
+        let policy = policy_with(true, vec![granted]);
+        let addr = spawn_ingress_with_validator(registry, Arc::new(PolicyValidator(policy))).await;
+        let target = spawn_burst_target(4096, 1024).await;
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, closed) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, 0);
+        assert!(closed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn granted_destination_goes_directly_when_no_connector_is_set() {
+        use crate::net::{ExitMode, ReverseEgressRegistry};
+        let registry = ReverseEgressRegistry::new(ExitMode::Local);
+        let policy = policy_with(true, vec![loopback_rule(None)]);
+        let addr = spawn_ingress_with_validator(registry, Arc::new(PolicyValidator(policy))).await;
+        let target = spawn_burst_target(4096, 1024).await;
+
+        let (client, to_tunnel, mut from_tunnel) = connect_client_raw(addr).await;
+        wait_for_legs(&client).await;
+        let (got, _) = fetch_via_client(&to_tunnel, &mut from_tunnel, target).await;
+        assert_eq!(got, 4096);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

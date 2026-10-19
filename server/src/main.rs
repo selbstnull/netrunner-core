@@ -224,6 +224,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     require_auth: bool,
 
+    /// Принимать коннекторы организации: узлы во внутренней сети клиента сами
+    /// набирают эту ноду (`netrunner-connector`) и открывают потоки к
+    /// ресурсам, недостижимым снаружи. Требует `--require-auth` и бэкенд,
+    /// который проверяет токены коннекторов. Сам по себе трафик через них не
+    /// идёт — только то, что политика пользователя помечает «через коннектор».
+    #[arg(long, default_value_t = false, requires = "require_auth")]
+    connectors: bool,
+
     /// Enable authenticated peer routing. This node can accept mesh traffic
     /// and route local client streams according to --mesh-max-hops.
     #[arg(long, default_value_t = false)]
@@ -642,6 +650,13 @@ fn main() {
     )
     .with_directory(args.directory_file.clone(), args.directory_gossip_interval)
     .with_endorsements(args.endorsement.clone());
+    let net = if args.connectors {
+        net.with_connectors(netrunner_core::net::ReverseEgressRegistry::new(
+            netrunner_core::net::ExitMode::Local,
+        ))
+    } else {
+        net
+    };
 
     let active_connections = net.active_connections();
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");

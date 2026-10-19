@@ -35,6 +35,7 @@
 //! хендлеры/менеджер сессий (через `connection`) и [`Muxer`] с глобальной оценкой
 //! [`GLOBAL_MIN_RTT`], а также все константы.
 
+pub mod access_policy;
 mod auth;
 mod config;
 mod credit;

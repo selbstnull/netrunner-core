@@ -67,6 +67,45 @@ impl RemoteOpener {
         token: CancellationToken,
         strong_privacy: bool,
     ) {
+        match self
+            .destination_verdict(&target, crate::net::access_policy::Proto::Tcp)
+            .await
+        {
+            crate::net::access_policy::Verdict::Deny => {
+                self.muxer.trace_outcome(stream_id, "rejected_by_access_policy");
+                self.reject_stream(stream_id, token).await;
+                return;
+            }
+            // Ресурс за коннектором: сервис во внутренней сети клиента, нода
+            // его не видит. Только через этот коннектор и никогда напрямую —
+            // иначе поток ушёл бы с ноды на тот же адрес в публичной сети.
+            crate::net::access_policy::Verdict::Allow { via: Some(label) } => {
+                let session = self
+                    .reverse_egress
+                    .as_ref()
+                    .and_then(|registry| registry.pick_labeled(&label));
+                match session {
+                    Some(session) => {
+                        self.muxer.trace_route(stream_id, Route::Reverse);
+                        tokio::spawn(Self::open_via_reverse_egress(
+                            self.muxer.clone(),
+                            session,
+                            stream_id,
+                            target,
+                            v_rx,
+                            token,
+                        ));
+                    }
+                    None => {
+                        self.muxer
+                            .trace_outcome(stream_id, "refused_connector_unavailable");
+                        self.reject_stream(stream_id, token).await;
+                    }
+                }
+                return;
+            }
+            crate::net::access_policy::Verdict::Allow { via: None } => {}
+        }
         if !self.mesh_peer
             && self
                 .mesh_route
@@ -150,6 +189,17 @@ impl RemoteOpener {
         token: CancellationToken,
         strong_privacy: bool,
     ) {
+        // Коннектор переносит только TCP: UDP к ресурсу за коннектором не
+        // может ни уйти с ноды напрямую, ни пройти через него — закрываем.
+        if !matches!(
+            self.destination_verdict(&target, crate::net::access_policy::Proto::Udp)
+                .await,
+            crate::net::access_policy::Verdict::Allow { via: None }
+        ) {
+            self.muxer.trace_outcome(stream_id, "rejected_by_access_policy");
+            self.reject_stream(stream_id, token).await;
+            return;
+        }
         // Reverse egress carries TCP only. Never let UDP exit locally while the owner
         // asked for (or currently has) a remote exit.
         if self.egress_policy.is_some() {
@@ -352,6 +402,20 @@ impl RemoteOpener {
             false,
         )
         .await;
+    }
+
+    /// Политика доступа сотрудника организации (ZTNA на ноде). Без политики —
+    /// всегда `true`, поведение прежнее. С политикой — отказ по умолчанию
+    /// закрывает всё, что не выдано (см. `net::access_policy`).
+    async fn destination_verdict(
+        &self,
+        target: &str,
+        proto: crate::net::access_policy::Proto,
+    ) -> crate::net::access_policy::Verdict {
+        match self.muxer.access_policy() {
+            None => crate::net::access_policy::Verdict::Allow { via: None },
+            Some(policy) => super::policy_gate::evaluate(&policy, target, proto).await,
+        }
     }
 
     async fn reject_stream(&self, stream_id: u32, token: CancellationToken) {
