@@ -111,6 +111,9 @@ pub struct Network {
     gossip_interval_secs: u64,
     /// Источники поручительств (hex или файлы): перечитываются каждый раунд.
     endorsement_sources: Vec<String>,
+    /// Число реально обслуживаемых физических соединений — общий счётчик для
+    /// `/health` и панели управления.
+    active_connections: Arc<AtomicU64>,
 }
 
 impl Network {
@@ -161,7 +164,13 @@ impl Network {
             directory_file: None,
             gossip_interval_secs: 15,
             endorsement_sources: Vec::new(),
+            active_connections: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Счётчик активных соединений (для панели управления).
+    pub fn active_connections(&self) -> Arc<AtomicU64> {
+        self.active_connections.clone()
     }
 
     /// Запускает сервер: слушает TCP и обслуживает соединения до отмены `token`.
@@ -552,7 +561,7 @@ impl Network {
         // "процесс жив", а "сколько клиентов на нём висит". Отдаётся в /health
         // и используется ниже, чтобы дождаться отключения клиентов при
         // остановке вместо мгновенного разрыва при drop рантайма.
-        let active_connections = Arc::new(AtomicU64::new(0));
+        let active_connections = self.active_connections.clone();
 
         if let Some(health_port) = self.health_port {
             let health_token = token.clone();

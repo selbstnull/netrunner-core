@@ -5,7 +5,9 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=/root/netr-core
-ExecStart=/root/netr-core/netrunner-server --host=0.0.0.0 --port=443 --health-port=9091 --metrics-port=9093
+# Панель управления: только 127.0.0.1:4444, доступ — `ssh -L 4444:127.0.0.1:4444 root@узел`.
+ExecStartPre=/usr/bin/install -d -m 700 /var/lib/netrunner-admin
+ExecStart=/root/netr-core/netrunner-server --host=0.0.0.0 --port=443 --health-port=9091 --metrics-port=9093 --admin-port=4444 --admin-dir=/var/lib/netrunner-admin
 Restart=always
 RestartSec=3
 LimitNOFILE=65535

@@ -123,6 +123,7 @@ curl -s http://127.0.0.1:9091/            # {"status":"ok","active_connections":
 | `--mesh-enabled`, `--mesh-max-hops`, `--mesh-quic-port` | выкл, `2`, `8443` | mesh (§11) |
 | `--health-port` | выкл | `/health`, только `127.0.0.1` |
 | `--metrics-port` | выкл | `/metrics` Prometheus, на **`0.0.0.0`** |
+| `--admin-port`, `--admin-dir` | выкл, `./netrunner-admin` | локальная панель управления: слушает **только `127.0.0.1`**, токен в `<admin-dir>/admin.token`; с ПК — `ssh -L 4444:127.0.0.1:4444 user@узел`, см. [server/README.MD](../server/README.MD) |
 
 Переменные окружения:
 

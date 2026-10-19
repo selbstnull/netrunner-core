@@ -10,6 +10,7 @@
 // Workaround for rustc 1.94 ICE in check_mod_deathness (dead-code MIR pass).
 #![allow(dead_code)]
 
+mod admin;
 mod backend_client;
 mod decoy_site;
 mod diagnostics;
@@ -260,6 +261,18 @@ struct Args {
     /// observability-VPS. Не задан — метрики выключены.
     #[arg(long)]
     metrics_port: Option<u16>,
+
+    /// Порт локальной панели управления (ключи mesh-сетей, доверенности, ротация).
+    /// Слушает ТОЛЬКО 127.0.0.1 — адрес не настраивается; с другой машины — через
+    /// `ssh -L`. Токен панели создаётся в `--admin-dir/admin.token` (0600). Не задан —
+    /// панель выключена.
+    #[arg(long, env = "NETRUNNER_ADMIN_PORT")]
+    admin_port: Option<u16>,
+
+    /// Каталог данных панели: состояние (`state.json`, содержит секретные ключи),
+    /// журнал аудита и токен. Создаётся с правами 0700.
+    #[arg(long, env = "NETRUNNER_ADMIN_DIR", default_value = admin::DEFAULT_DIR)]
+    admin_dir: std::path::PathBuf,
 }
 
 fn main() {
@@ -422,6 +435,8 @@ fn main() {
             std::env::var("PROXY_NRXP_PRIVATE_KEY").ok(),
         ),
     };
+    // Что узел выдаёт своим клиентам (для генератора client.toml в панели).
+    let mut client_creds: Option<admin::node::ClientCreds> = None;
     let identity = match nrxp_env {
         (Some(secret), Some(private_key)) => {
             // Пока false, нода принимает и клиентов старой анонимной схемы —
@@ -447,6 +462,10 @@ fn main() {
                 "NRXP identity loaded"
             );
             nrxp_strict_flag = strict;
+            client_creds = Some(admin::node::ClientCreds {
+                secret: secret.clone(),
+                public_key: local.public_key_hex(),
+            });
             Some(Identity::Local(local))
         }
         (None, None) => {
@@ -473,9 +492,9 @@ fn main() {
     // no-op recorder по умолчанию (штатное поведение крейта metrics).
     let nrxp_configured_flag = identity.is_some();
 
-    let metrics_handle = args
-        .metrics_port
-        .map(|_| metrics_server::install_recorder());
+    // Рекордер нужен и панели управления (обзор строит графики по метрикам процесса).
+    let metrics_handle = (args.metrics_port.is_some() || args.admin_port.is_some())
+        .then(metrics_server::install_recorder);
 
     // Только после install_recorder: до него макросы metrics! уходят в
     // no-op-рекордер по умолчанию и значение бы потерялось.
@@ -614,7 +633,7 @@ fn main() {
         auth,
         args.require_auth,
         args.mesh_enabled || swarm_mode,
-        mesh,
+        mesh.clone(),
         args.mesh_quic_port,
         args.health_port,
         identity,
@@ -624,6 +643,7 @@ fn main() {
     .with_directory(args.directory_file.clone(), args.directory_gossip_interval)
     .with_endorsements(args.endorsement.clone());
 
+    let active_connections = net.active_connections();
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     rt.block_on(async {
@@ -638,13 +658,57 @@ fn main() {
             net.run(run_token).await;
         });
 
-        if let (Some(port), Some(handle)) = (args.metrics_port, metrics_handle) {
+        if let (Some(port), Some(handle)) = (args.metrics_port, metrics_handle.clone()) {
             let metrics_token = token.clone();
             tokio::spawn(metrics_server::run(
                 "0.0.0.0".to_string(),
                 port,
                 handle,
                 metrics_token,
+            ));
+        }
+
+        if let Some(port) = args.admin_port {
+            let node = admin::node::NodeView::new(admin::node::NodeParts {
+                mode: if swarm_mode {
+                    "swarm"
+                } else if auth_required_by_node {
+                    "panel"
+                } else {
+                    "standalone"
+                },
+                config: serde_json::json!({
+                    "port": args.port, "host": args.host,
+                    "decoy_host": args.decoy_host, "decoy_mode": args.decoy_mode,
+                    "decoy_preset": args.decoy_preset, "decoy_sni": args.decoy_sni,
+                    "mesh_enabled": args.mesh_enabled || swarm_mode,
+                    "mesh_max_hops": args.mesh_max_hops, "mesh_quic_port": args.mesh_quic_port,
+                    "require_auth": args.require_auth,
+                    "backend": args.backend_url.is_some(),
+                    "health_port": args.health_port, "metrics_port": args.metrics_port,
+                    "admin_port": args.admin_port,
+                    "nrxp_configured": client_creds.is_some(), "strict": nrxp_strict_flag,
+                    "swarm": swarm_mode, "advertise": args.advertise,
+                    "directory_file": args.directory_file.is_some(),
+                    "gossip_interval": args.directory_gossip_interval,
+                    "cover_flight": args.cover_flight.is_some(),
+                    "shape_profile": args.shape_profile.is_some(),
+                }),
+                directory: swarm_directory.clone(),
+                mesh: mesh.clone(),
+                active_connections,
+                metrics: metrics_handle.clone(),
+                shutdown: token.clone(),
+                creds: client_creds,
+                advertise: args.advertise.clone(),
+                decoy_host: args.decoy_host.clone(),
+                strict: nrxp_strict_flag,
+            });
+            tokio::spawn(admin::run(
+                port,
+                args.admin_dir.clone(),
+                Arc::new(node),
+                token.clone(),
             ));
         }
 

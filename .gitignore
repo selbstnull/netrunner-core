@@ -9,3 +9,9 @@ repomix-output.xml
 /logs
 netrunner_diagnostics.jsonl
 netrunner_client_diag_*.jsonl
+
+# локальная панель: state.json с секретными ключами и токен
+netrunner-admin/
+
+# документация по архитектуре
+docs/architecture/
