@@ -1,0 +1,123 @@
+[package]
+authors = ["Kirill Trapeznikov <netrunner_admin@netrunner-vpn.com>"]
+license-file = "../LICENSE"
+name = "pkg_votisy"
+version = "0.4.0"
+edition = "2021"
+
+
+[dependencies]
+chacha20poly1305 = "0.10.1"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "chacha", "x25519"] }
+# Raw ChaCha20 keystream (no Poly1305), already in the tree transitively via
+# chacha20poly1305 0.10 — pinned as a direct dependency for `quiceng`'s QUIC-style
+# header protection (RFC 9001 §5.4.4 defines the mask as a raw ChaCha20 block,
+# not an AEAD call, so `chacha20poly1305`'s AEAD-only API doesn't cover it).
+chacha20 = "0.9"
+# QUIC Initial-пакеты (`quiceng::initial`) шифруются AES-128-GCM с
+# AES-ECB header protection (RFC 9001 §5), а не нашим ChaCha20-Poly1305: ключи
+# Initial публичны (выводятся из соли и открытого DCID), поэтому пакет обязан
+# быть НАСТОЯЩИМ QUIC Initial, который расшифровывает и разбирает любой QUIC-стек
+# (в т.ч. DPI) — иначе по содержимому он не проходит проверку как QUIC. Обе —
+# чистый Rust RustCrypto, работают и на wasm.
+aes-gcm = "0.10"
+aes = "0.8"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+# Подписи самоописаний узлов (net::directory): личность узла = ключи, а не запись в панели.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+aead = { version = "0.5.2", features = ["bytes"] }
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+# Constant-time primitives. The hand-rolled `diff |= a ^ b` accumulator that
+# used to live in `crypto::session` was correct as written, but nothing stopped
+# LLVM from turning the final `(diff == 0)` back into a branch — a Rust-level
+# test cannot observe that. `subtle` carries optimisation barriers, so the
+# invariant survives the optimiser instead of depending on its mood.
+subtle = "2.6"
+# Wiping key material on drop. Derived session keys used to be plain `[u8; 32]`
+# fields: dropping them just released the memory, leaving keys readable in core
+# dumps, swap and VM snapshots. That contradicts the forward-secrecy claim,
+# which is about "recover the server later", not "read RAM now".
+zeroize = { version = "1.8", features = ["derive"] }
+bytes = "1.5"
+# `net::connection` (tokio net/rt/socket-driven tunnel orchestration) is
+# compiled only for non-wasm targets — see the `#[cfg]` in `core/src/net/mod.rs`.
+# wasm32-unknown-unknown has no tokio net driver at all, so both tokio's "full"
+# feature and the OS-socket-tuning crates below (socket2, libc) only make sense
+# there; the base feature set here is the minimum `edge`/`nrxp`/`crypto`/`tlseng`
+# need on every target (macros for async fns in tests, sync for mpsc types used
+# by call sites outside this crate).
+tokio = { version = "1.49.0", default-features = false, features = ["macros", "sync"] }
+rand = "0.10.0"
+# Transitive random-number backend, pulled in (in several major versions, via
+# rand/x25519-dalek/aead) for X25519 ephemeral keys, salts and NRXP padding.
+# On wasm32-unknown-unknown there's no OS RNG syscall, so every major version
+# in the dependency graph needs its JS-backed feature enabled explicitly —
+# Cargo unifies these onto the same transitive crate. Harmless on native
+# targets (the feature is a no-op there).
+getrandom = { version = "0.2", features = ["js"] }
+getrandom3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom4 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+hex = "0.4.3"
+base64 = "0.22"
+async-trait = "0.1.89"
+dashmap = "6.1.0"
+arc-swap = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pkg_lija = { path = "../logger" }
+
+# Pulled in only for the tokio::net-based tunnel orchestration (`net::connection`),
+# which is unavailable on wasm32-unknown-unknown. Kept target-gated so `cargo
+# check --target wasm32-unknown-unknown -p netrunner-core` (used by the edge/
+# Cloudflare Workers client) doesn't try to build mio/socket2/libc for wasm.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+# Только для `ServerHandler::run` (см. net/connection/connection.rs) — считает
+# scanner-fallback/auth-failed/vpn-established отдельно от голого TCP-accept
+# (тот считается в server/src/network.rs). Клиентский код этот путь никогда не
+# исполняет (ServerHandler конструируется только в server/), поэтому здесь
+# просто неиспользуемая зависимость на клиентских сборках — тот же порядок
+# цены, что и уже используемый в этом крейте `tracing`.
+metrics = "0.24.3"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "0.14", optional = true }
+ring = { version = "0.17", optional = true }
+
+# `std::time::SystemTime::now()` panics on wasm32-unknown-unknown ("time not
+# implemented on this platform" — no OS clock syscall there). web-time is an
+# API-compatible drop-in backed by JS Date.now() on wasm32; see
+# crypto/session.rs::now_unix_secs, the only place this crate reads wall time
+# on a path client-edge (Cloudflare Workers) actually exercises.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1.1"
+
+# Инструментальная фича: включает `pub mod devtools` (эмиттеры QUIC-пакетов для
+# ручной проверки в Wireshark/tshark). Выключена по умолчанию — в обычные
+# сборки/тесты не попадает, прод-путь не трогает.
+[features]
+dev-dump = []
+mesh-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "ring-aead"]
+ring-aead = ["dep:ring"]
+# Разбор pcap/pcapng и снятие браузерного профиля (core/src/pcap). Без внешних
+# зависимостей; в обычные и wasm-сборки не попадает.
+pcap = []
+
+# Пример собирается ТОЛЬКО с `--features dev-dump`, иначе `cargo build --examples`
+# не тянет его в обычных сборках.
+[[example]]
+name = "quic_initial_dump"
+required-features = ["dev-dump"]
+
+[[example]]
+name = "pcap_profile"
+required-features = ["pcap"]
+
+[lib]
+name = "netrunner_core"

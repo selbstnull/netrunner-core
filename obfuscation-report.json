@@ -1,0 +1,1638 @@
+{
+  "cargo_check": "manual",
+  "notes": {},
+  "out": "/home/kirill/netrunner/netrunner-obf",
+  "path_diagnostics": [],
+  "plan": {
+    "protected_tier_a": 435,
+    "renamed_tier_a": 2059,
+    "renamed_tier_b": 299,
+    "skipped_tier_b": {
+      "common-method": 3,
+      "extern-api-name": 60,
+      "ffi/udl": 35,
+      "field-use-without-owner-resolution": 788,
+      "macro-ident": 53,
+      "method-use-without-receiver-resolution": 644,
+      "not-unique": 60,
+      "prelude": 8,
+      "unresolved-ref": 2
+    },
+    "tier_b_map": [
+      [
+        "ALPS",
+        "sofa"
+      ],
+      [
+        "Absorbed",
+        "naqoko1"
+      ],
+      [
+        "Ack",
+        "tebome"
+      ],
+      [
+        "Alert",
+        "detano1"
+      ],
+      [
+        "Auto",
+        "neseta4"
+      ],
+      [
+        "BASE",
+        "line57"
+      ],
+      [
+        "BRIDGE",
+        "jydy1"
+      ],
+      [
+        "BROWSER_STANDARD",
+        "siwi5"
+      ],
+      [
+        "BadAddress",
+        "jari66"
+      ],
+      [
+        "BadEncoding",
+        "tyzu1"
+      ],
+      [
+        "BadEndpoint",
+        "firaze"
+      ],
+      [
+        "BadHex",
+        "xagobe"
+      ],
+      [
+        "BadMagic",
+        "fuko4"
+      ],
+      [
+        "BadNodeId",
+        "reli"
+      ],
+      [
+        "BadSignature",
+        "kybi6"
+      ],
+      [
+        "BadSyntax",
+        "turilu1"
+      ],
+      [
+        "BadValidity",
+        "wiqu"
+      ],
+      [
+        "BadValue",
+        "nypu1"
+      ],
+      [
+        "BadVersion",
+        "gufy1"
+      ],
+      [
+        "Bind",
+        "zabo"
+      ],
+      [
+        "Blocked",
+        "vykise20"
+      ],
+      [
+        "Bridge",
+        "kyqeqi12"
+      ],
+      [
+        "Build",
+        "jawuly1"
+      ],
+      [
+        "CHROME",
+        "kogaje"
+      ],
+      [
+        "CHROME_131",
+        "qetu"
+      ],
+      [
+        "CHROME_PQ",
+        "rysa"
+      ],
+      [
+        "CHROMIUM",
+        "begoza2"
+      ],
+      [
+        "CHROMIUM_131",
+        "vapapo63"
+      ],
+      [
+        "CHROMIUM_PQ",
+        "gajaga15"
+      ],
+      [
+        "COMPAT",
+        "kupodu"
+      ],
+      [
+        "COMPRESS_CERT",
+        "quwide"
+      ],
+      [
+        "ChaCha",
+        "ryxe"
+      ],
+      [
+        "ChangeCipherSpec",
+        "xemixu"
+      ],
+      [
+        "Check",
+        "zolady18"
+      ],
+      [
+        "Connected",
+        "gizitu"
+      ],
+      [
+        "ConnectionClosed",
+        "lugasu"
+      ],
+      [
+        "ControlChannelFull",
+        "tubo17"
+      ],
+      [
+        "Count",
+        "xity"
+      ],
+      [
+        "Cover",
+        "fuwu"
+      ],
+      [
+        "DELEGATED_CREDENTIAL",
+        "dotuba1"
+      ],
+      [
+        "DecryptFailed",
+        "bejeni"
+      ],
+      [
+        "Direct",
+        "degoji13"
+      ],
+      [
+        "Done",
+        "quko"
+      ],
+      [
+        "DownloadBackpressure",
+        "buqy17"
+      ],
+      [
+        "Duplicate",
+        "xozana"
+      ],
+      [
+        "ECDSA_SECP256R1_SHA256",
+        "qazo"
+      ],
+      [
+        "ECDSA_SECP384R1_SHA384",
+        "gajinu1"
+      ],
+      [
+        "EC_POINT_FORMATS",
+        "tive"
+      ],
+      [
+        "EMS",
+        "zuju90"
+      ],
+      [
+        "EXIT",
+        "jemu"
+      ],
+      [
+        "Egress",
+        "zazuva8"
+      ],
+      [
+        "EgressNotAllowed",
+        "fezuzo10"
+      ],
+      [
+        "Expired",
+        "jybu30"
+      ],
+      [
+        "FIREFOX",
+        "sizi"
+      ],
+      [
+        "FIREFOX_130",
+        "xyte"
+      ],
+      [
+        "FIREFOX_133",
+        "fatu"
+      ],
+      [
+        "Failover",
+        "fyvi"
+      ],
+      [
+        "Fixed",
+        "wamovy"
+      ],
+      [
+        "Forward",
+        "dami1"
+      ],
+      [
+        "FromTheFuture",
+        "lipe4"
+      ],
+      [
+        "Full",
+        "fifo"
+      ],
+      [
+        "GREASE_SLOT_FIRST",
+        "fele"
+      ],
+      [
+        "GREASE_SLOT_LAST",
+        "tofy7"
+      ],
+      [
+        "Gossip",
+        "kato"
+      ],
+      [
+        "Grease",
+        "benuzu1"
+      ],
+      [
+        "HandlerFinished",
+        "zixo"
+      ],
+      [
+        "HostUnreachable",
+        "fyqoja1"
+      ],
+      [
+        "IpLiteral",
+        "gyfilu"
+      ],
+      [
+        "KEY_SHARE",
+        "segi91"
+      ],
+      [
+        "LegDisconnected",
+        "loso"
+      ],
+      [
+        "LegReconnecting",
+        "wiba"
+      ],
+      [
+        "Length",
+        "wypu"
+      ],
+      [
+        "MAX_RECORD",
+        "puqi"
+      ],
+      [
+        "MLDSA44",
+        "rawy16"
+      ],
+      [
+        "MLDSA65",
+        "mozufy"
+      ],
+      [
+        "MLDSA87",
+        "doqo6"
+      ],
+      [
+        "Merge",
+        "rumire1"
+      ],
+      [
+        "MeshOnionConnect",
+        "vapu18"
+      ],
+      [
+        "MeshOnionUdpConnect",
+        "katugi"
+      ],
+      [
+        "MeshQuic",
+        "wemy"
+      ],
+      [
+        "Mimicry",
+        "qemy1"
+      ],
+      [
+        "Missing",
+        "lefe"
+      ],
+      [
+        "Name",
+        "tipi55"
+      ],
+      [
+        "Nearest",
+        "dyti1"
+      ],
+      [
+        "NeedMore",
+        "nybe1"
+      ],
+      [
+        "NetUnreachable",
+        "qyro9"
+      ],
+      [
+        "NoSuchInterface",
+        "ziju1"
+      ],
+      [
+        "NonPublicAddress",
+        "byxedu"
+      ],
+      [
+        "NonceExhausted",
+        "beno"
+      ],
+      [
+        "NotAnInvite",
+        "wubi21"
+      ],
+      [
+        "NotEndorsed",
+        "rybisy"
+      ],
+      [
+        "NotLongHeader",
+        "xeje1"
+      ],
+      [
+        "NotOwned",
+        "tysyro"
+      ],
+      [
+        "OPUS_48K",
+        "deqeko"
+      ],
+      [
+        "Onion",
+        "dury1"
+      ],
+      [
+        "OtherLongType",
+        "xamu7"
+      ],
+      [
+        "PADDING",
+        "biwoke14"
+      ],
+      [
+        "PSK_MODES",
+        "sagi14"
+      ],
+      [
+        "Peer",
+        "suvi"
+      ],
+      [
+        "PeerGossip",
+        "kibaje13"
+      ],
+      [
+        "Pending",
+        "fokygo"
+      ],
+      [
+        "Permission",
+        "vypa"
+      ],
+      [
+        "Prefer",
+        "jazibe1"
+      ],
+      [
+        "PrefixLimit",
+        "rira1"
+      ],
+      [
+        "Profile",
+        "nomi"
+      ],
+      [
+        "Push",
+        "xogina14"
+      ],
+      [
+        "QuicLong",
+        "pyfinu"
+      ],
+      [
+        "QuicShort",
+        "pynazi1"
+      ],
+      [
+        "RELAY",
+        "salady"
+      ],
+      [
+        "RENEGOTIATION_INFO",
+        "jopyji"
+      ],
+      [
+        "RSA_PKCS1_SHA256",
+        "meqa17"
+      ],
+      [
+        "RSA_PKCS1_SHA384",
+        "quqy20"
+      ],
+      [
+        "RSA_PKCS1_SHA512",
+        "qaqa"
+      ],
+      [
+        "RSA_PSS_RSAE_SHA256",
+        "zida13"
+      ],
+      [
+        "RSA_PSS_RSAE_SHA384",
+        "sogi"
+      ],
+      [
+        "RSA_PSS_RSAE_SHA512",
+        "ginupe"
+      ],
+      [
+        "RandomUpTo",
+        "xyja9"
+      ],
+      [
+        "RateLimited",
+        "teqype10"
+      ],
+      [
+        "Real",
+        "vube"
+      ],
+      [
+        "Reconnecting",
+        "jaty"
+      ],
+      [
+        "Record",
+        "naduva17"
+      ],
+      [
+        "Recv",
+        "zeny"
+      ],
+      [
+        "Redirect",
+        "volimi1"
+      ],
+      [
+        "Refuse",
+        "wovida1"
+      ],
+      [
+        "Refused",
+        "degu"
+      ],
+      [
+        "Rejected",
+        "najozi6"
+      ],
+      [
+        "Require",
+        "jura3"
+      ],
+      [
+        "Resolve",
+        "mamolo17"
+      ],
+      [
+        "Rtp",
+        "zajeve"
+      ],
+      [
+        "RustCrypto",
+        "tire90"
+      ],
+      [
+        "SAFARI",
+        "gevu1"
+      ],
+      [
+        "SCT",
+        "myli1"
+      ],
+      [
+        "SEALED",
+        "zibo1"
+      ],
+      [
+        "SECP256R1",
+        "timo"
+      ],
+      [
+        "SECP384R1",
+        "wufe"
+      ],
+      [
+        "SECP521R1",
+        "kyty"
+      ],
+      [
+        "SESSION_TICKET",
+        "juqo"
+      ],
+      [
+        "SIGNATURE_ALGORITHMS",
+        "weqy12"
+      ],
+      [
+        "SNI",
+        "robo"
+      ],
+      [
+        "STATUS_REQUEST",
+        "duku"
+      ],
+      [
+        "SUPPORTED_GROUPS",
+        "sypo"
+      ],
+      [
+        "SUPPORTED_VERSIONS",
+        "juze"
+      ],
+      [
+        "Scid",
+        "wuja"
+      ],
+      [
+        "SecureConnect",
+        "xipe"
+      ],
+      [
+        "SecureUdpConnect",
+        "nyzi32"
+      ],
+      [
+        "SelfHosted",
+        "vaxali12"
+      ],
+      [
+        "ServerDefault",
+        "juruvo"
+      ],
+      [
+        "Shape",
+        "faze"
+      ],
+      [
+        "Shared",
+        "tojywa"
+      ],
+      [
+        "Shutdown",
+        "fygewo1"
+      ],
+      [
+        "Site",
+        "gixywe"
+      ],
+      [
+        "SniNotOwned",
+        "xijo"
+      ],
+      [
+        "Stale",
+        "fagugi"
+      ],
+      [
+        "StreamClosedWithError",
+        "zopiwy89"
+      ],
+      [
+        "Syntax",
+        "wolymi"
+      ],
+      [
+        "TLS_13_ONLY",
+        "fyga"
+      ],
+      [
+        "TLS_1_2",
+        "bykije"
+      ],
+      [
+        "TLS_1_3",
+        "pyke18"
+      ],
+      [
+        "Timeout",
+        "fipy"
+      ],
+      [
+        "Tls",
+        "rejima"
+      ],
+      [
+        "Tls10",
+        "busi53"
+      ],
+      [
+        "Tls12",
+        "vonu"
+      ],
+      [
+        "Tls13",
+        "babure14"
+      ],
+      [
+        "TooLarge",
+        "fexudu10"
+      ],
+      [
+        "Truncated",
+        "wupywo5"
+      ],
+      [
+        "Tunnel",
+        "zufeja11"
+      ],
+      [
+        "TunnelWriteStuck",
+        "rokoni1"
+      ],
+      [
+        "TwoHop",
+        "gedo6"
+      ],
+      [
+        "UnauthorizedBridgeHint",
+        "qevibe1"
+      ],
+      [
+        "UnexpectedMessage",
+        "juvi16"
+      ],
+      [
+        "UnfilledSlot",
+        "texe3"
+      ],
+      [
+        "UnknownBlock",
+        "besu17"
+      ],
+      [
+        "UnknownMode",
+        "purosa13"
+      ],
+      [
+        "UnknownTag",
+        "koso"
+      ],
+      [
+        "Unsupported",
+        "kozo39"
+      ],
+      [
+        "UnsupportedSuite",
+        "xikipo11"
+      ],
+      [
+        "UnsupportedVersion",
+        "roki"
+      ],
+      [
+        "Updated",
+        "rozupi9"
+      ],
+      [
+        "UploadFailed",
+        "zupu"
+      ],
+      [
+        "VP8_VIDEO",
+        "zive1"
+      ],
+      [
+        "VersionInformation",
+        "jolazu"
+      ],
+      [
+        "Via",
+        "lidiwi"
+      ],
+      [
+        "Wait",
+        "sivevi2"
+      ],
+      [
+        "WeightedRandom",
+        "wosoze1"
+      ],
+      [
+        "X25519",
+        "bozote1"
+      ],
+      [
+        "X25519_MLKEM768",
+        "wynata"
+      ],
+      [
+        "_from_slice",
+        "qutote1"
+      ],
+      [
+        "_to_u32",
+        "dize"
+      ],
+      [
+        "asset",
+        "jafyzy91"
+      ],
+      [
+        "auth_key_fingerprint",
+        "zajeku1"
+      ],
+      [
+        "bind_with_big_rcvbuf",
+        "ribo"
+      ],
+      [
+        "bridge_via_peer",
+        "pane9"
+      ],
+      [
+        "build_application_data",
+        "wuso92"
+      ],
+      [
+        "build_change_cipher_spec",
+        "mosa11"
+      ],
+      [
+        "build_merkle_cache",
+        "xiwyfe"
+      ],
+      [
+        "build_middlebox_ccs",
+        "kimi13"
+      ],
+      [
+        "circuit_open_error",
+        "kisile56"
+      ],
+      [
+        "compute_handshake_tag",
+        "wupi8"
+      ],
+      [
+        "compute_handshake_tag_for_version",
+        "qipizo"
+      ],
+      [
+        "compute_handshake_tag_for_version_and_preference",
+        "nyfo1"
+      ],
+      [
+        "compute_handshake_tag_for_version_cipher_and_route",
+        "xozaka"
+      ],
+      [
+        "compute_tag",
+        "gyjeve"
+      ],
+      [
+        "connect_egress",
+        "kequpu2"
+      ],
+      [
+        "connect_inner",
+        "makeva"
+      ],
+      [
+        "connect_mesh_quic_peer",
+        "tuwo5"
+      ],
+      [
+        "connect_mesh_session_with_challenge",
+        "galaqo58"
+      ],
+      [
+        "connect_mesh_tcp_peer",
+        "nazu"
+      ],
+      [
+        "connect_stream",
+        "nysa45"
+      ],
+      [
+        "connect_with_privacy_and_cipher",
+        "xupe67"
+      ],
+      [
+        "connect_with_privacy_and_preferences",
+        "xofyfa3"
+      ],
+      [
+        "connect_with_privacy_mode",
+        "dari14"
+      ],
+      [
+        "derive",
+        "malyna"
+      ],
+      [
+        "derive_epoch",
+        "ryre11"
+      ],
+      [
+        "derive_from_root",
+        "viryxo82"
+      ],
+      [
+        "derive_from_root_ctx",
+        "xure"
+      ],
+      [
+        "detached",
+        "sara"
+      ],
+      [
+        "establish_leg",
+        "ryte13"
+      ],
+      [
+        "execute_strategy",
+        "qapafy"
+      ],
+      [
+        "expand_key",
+        "gowovu"
+      ],
+      [
+        "extract_key",
+        "lesa"
+      ],
+      [
+        "extract_peer_public",
+        "vani4"
+      ],
+      [
+        "fixed",
+        "bati98"
+      ],
+      [
+        "for_decoy",
+        "demi1"
+      ],
+      [
+        "for_reverse_egress",
+        "kusofe"
+      ],
+      [
+        "from_chain",
+        "qure12"
+      ],
+      [
+        "from_client_hello",
+        "nageby12"
+      ],
+      [
+        "from_descriptor",
+        "barove1"
+      ],
+      [
+        "from_descriptors",
+        "wosaji15"
+      ],
+      [
+        "from_entries",
+        "livo"
+      ],
+      [
+        "from_env",
+        "jeweri"
+      ],
+      [
+        "from_hellos",
+        "luva1"
+      ],
+      [
+        "from_io",
+        "nyvo"
+      ],
+      [
+        "from_json",
+        "mobi2"
+      ],
+      [
+        "from_learned",
+        "xexoza17"
+      ],
+      [
+        "from_list",
+        "dajyjo1"
+      ],
+      [
+        "from_nrxp",
+        "lozi16"
+      ],
+      [
+        "from_observed",
+        "fufo"
+      ],
+      [
+        "from_private_hex",
+        "jixo"
+      ],
+      [
+        "from_records",
+        "dyvoda"
+      ],
+      [
+        "from_root",
+        "gyru"
+      ],
+      [
+        "from_static_private",
+        "sute"
+      ],
+      [
+        "from_tls_suite",
+        "toriro"
+      ],
+      [
+        "from_u8",
+        "byni"
+      ],
+      [
+        "from_wire_code",
+        "bulozo"
+      ],
+      [
+        "from_wire_codes",
+        "pyxusi"
+      ],
+      [
+        "from_wire_value",
+        "quwaki11"
+      ],
+      [
+        "generate_handshake_tag",
+        "soqavu"
+      ],
+      [
+        "generate_id",
+        "witupo"
+      ],
+      [
+        "get_local_ip",
+        "mamu8"
+      ],
+      [
+        "get_public_hash",
+        "nidy"
+      ],
+      [
+        "handle_stealth_fallback",
+        "nuko"
+      ],
+      [
+        "init_global",
+        "xuje1"
+      ],
+      [
+        "initial_offset",
+        "lemepa"
+      ],
+      [
+        "invalidate_merkle",
+        "nulevi"
+      ],
+      [
+        "issue_for",
+        "binyzy"
+      ],
+      [
+        "log_info",
+        "vazi"
+      ],
+      [
+        "make_client_hello",
+        "byruga"
+      ],
+      [
+        "make_quic_hello",
+        "wetoga"
+      ],
+      [
+        "make_server_hello",
+        "weti68"
+      ],
+      [
+        "make_server_hello_with_suite",
+        "nori81"
+      ],
+      [
+        "new_quic",
+        "fabebi"
+      ],
+      [
+        "node_default",
+        "ketigo"
+      ],
+      [
+        "open_local_tcp_with_egress_failover",
+        "vypuxa9"
+      ],
+      [
+        "open_local_udp_with_egress_failover",
+        "vuniky12"
+      ],
+      [
+        "open_via_mesh",
+        "zizu"
+      ],
+      [
+        "open_via_onion",
+        "gosylo10"
+      ],
+      [
+        "open_via_reverse_egress",
+        "xugi"
+      ],
+      [
+        "pack_app_data",
+        "tojepu"
+      ],
+      [
+        "parse_reply",
+        "dapoxa"
+      ],
+      [
+        "peek_leg_token",
+        "webi13"
+      ],
+      [
+        "perform_handshake",
+        "pine12"
+      ],
+      [
+        "perform_handshake_on_connection",
+        "dogina"
+      ],
+      [
+        "perform_mesh_quic_handshake",
+        "maxe5"
+      ],
+      [
+        "pool_to_json",
+        "buniju"
+      ],
+      [
+        "rx_epoch_id",
+        "nivyqo9"
+      ],
+      [
+        "select_cipher_suite",
+        "rizi14"
+      ],
+      [
+        "select_requested_cipher_suite",
+        "tofyto"
+      ],
+      [
+        "serialize_merkle",
+        "gejy17"
+      ],
+      [
+        "set_mode",
+        "xufa17"
+      ],
+      [
+        "set_policy",
+        "rixi10"
+      ],
+      [
+        "shuffle_middle",
+        "jeby11"
+      ],
+      [
+        "sign_endorsed",
+        "wure6"
+      ],
+      [
+        "sign_own",
+        "saqy11"
+      ],
+      [
+        "spawn_backlog_drainer",
+        "kanipy18"
+      ],
+      [
+        "start_process",
+        "kula3"
+      ],
+      [
+        "step_chain",
+        "deryxe1"
+      ],
+      [
+        "synthetic",
+        "puluna40"
+      ],
+      [
+        "to_nrxp",
+        "ganuvo13"
+      ],
+      [
+        "unpack_app_data",
+        "giwoby"
+      ],
+      [
+        "unpack_handshake",
+        "vyse"
+      ],
+      [
+        "unpack_middlebox_ccs",
+        "mowe5"
+      ],
+      [
+        "window_cap",
+        "qolepe"
+      ],
+      [
+        "wire_len",
+        "goga2"
+      ],
+      [
+        "with_cause",
+        "jefeli"
+      ],
+      [
+        "with_grease",
+        "xudida7"
+      ],
+      [
+        "with_max_hops",
+        "rydo4"
+      ],
+      [
+        "with_max_hops_and_quic_port",
+        "vikexe10"
+      ],
+      [
+        "wrap_client_hello",
+        "kuqu"
+      ],
+      [
+        "wrap_server_hello",
+        "laxope"
+      ]
+    ]
+  },
+  "protected_names": [
+    "const ALPN (macro-ident)",
+    "const ASSETS (macro-ident)",
+    "const AUTH_KEY (macro-ident)",
+    "const AUTH_TIME_STEP (unresolved-ref)",
+    "const BRIDGE_STREAM_WRITE_TIMEOUT (macro-ident)",
+    "const BUFFERBLOAT_WARN_THRESHOLD (macro-ident)",
+    "const BUF_CAP (macro-ident)",
+    "const BUF_FLOOR (macro-ident)",
+    "const C (macro-ident)",
+    "const C (unresolved-ref)",
+    "const CAPACITY (macro-ident)",
+    "const CAPSULE_VERSION (macro-ident)",
+    "const CAPS_REQUEST (unresolved-ref)",
+    "const CELL_COUNT (macro-ident)",
+    "const CELL_WIRE_LEN (macro-ident)",
+    "const CONN_CONNECTED (macro-ident)",
+    "const CONN_IDLE (macro-ident)",
+    "const CREDIT_INITIAL_WINDOW (macro-ident)",
+    "const CREDIT_MAX_WINDOW (macro-ident)",
+    "const CREDIT_STALL_FALLBACK (unresolved-ref)",
+    "const DATAGRAM_LEG_HANDSHAKE_TIMEOUT (macro-ident)",
+    "const DATAGRAM_LEG_ID (macro-ident)",
+    "const DCID (macro-ident)",
+    "const DEFAULT_SAMPLES (unresolved-ref)",
+    "const ECH (unresolved-ref)",
+    "const ERR_INFRA_TIMEOUT (macro-ident)",
+    "const ERR_NET_TLS_TAMPER (macro-ident)",
+    "const ERR_SYS_PANIC (macro-ident)",
+    "const EXTENSION_BIT (macro-ident)",
+    "const EXTENSION_LEN (macro-ident)",
+    "const EXT_NAMES (macro-ident)",
+    "const FAKE_IP_START (macro-ident)",
+    "const FAKE_PUB_KEY (macro-ident)",
+    "const FLOOR_RANGE (macro-ident)",
+    "const GAP_CAP (macro-ident)",
+    "const ICMP_BUFFER_SIZE (macro-ident)",
+    "const ICMP_META_SLOTS (macro-ident)",
+    "const INITIAL_RTT_MS (unresolved-ref)",
+    "const INTERVAL_SECS (macro-ident)",
+    "const K (macro-ident)",
+    "const KB (macro-ident)",
+    "const LEGACY_CAPSULE_VERSION (macro-ident)",
+    "const LT_ETHERNET (macro-ident)",
+    "const LT_LINUX_SLL (macro-ident)",
+    "const LT_LINUX_SLL2 (macro-ident)",
+    "const LT_NULL (macro-ident)",
+    "const LT_RAW (macro-ident)",
+    "const MAX_CHAIN (macro-ident)",
+    "const MAX_DATAGRAM_LEG_PAYLOAD (macro-ident)",
+    "const MAX_DIGEST_ENTRIES (unresolved-ref)",
+    "const MAX_EGRESS_FAILOVERS (unresolved-ref)",
+    "const MAX_FRAME_PAYLOAD (macro-ident)",
+    "const MAX_HINT_RECORDS (unresolved-ref)",
+    "const MAX_HISTORY (macro-ident)",
+    "const MAX_INTERNAL_RECONNECT_ATTEMPTS (macro-ident)",
+    "const MAX_PENDING_BYTES_PER_SOCKET (macro-ident)",
+    "const MAX_PENDING_UDP_STREAMS (macro-ident)",
+    "const MAX_PER_GRANT (macro-ident)",
+    "const MAX_RECORD_BYTES (macro-ident)",
+    "const MAX_RECORD_LEN (macro-ident)",
+    "const MAX_RECORD_PLAINTEXT (macro-ident)",
+    "const MAX_REPORTS_PER_MESSAGE (macro-ident)",
+    "const MAX_TUNNEL_LEGS (macro-ident)",
+    "const MAX_VALIDITY_SECS (macro-ident)",
+    "const MESH (macro-ident)",
+    "const MIN_INITIAL_DATAGRAM_LEN (macro-ident)",
+    "const MIN_RECORD (unresolved-ref)",
+    "const N (macro-ident)",
+    "const NOW (macro-ident)",
+    "const PENDING_STALL_TIMEOUT (macro-ident)",
+    "const PENDING_UDP_STREAM_MAX_BYTES (macro-ident)",
+    "const PING (macro-ident)",
+    "const PK (macro-ident)",
+    "const PONG (macro-ident)",
+    "const PUBLIC_DNS_RESOLVER (macro-ident)",
+    "const Q (macro-ident)",
+    "const QUIC_DATAGRAM_SEND_BUFFER (macro-ident)",
+    "const RECV_BUF_LEN (macro-ident)",
+    "const REPLAY_WINDOW_SIZE (macro-ident)",
+    "const REPORT_LIFETIME_SECS (macro-ident)",
+    "const ROLES (unresolved-ref)",
+    "const RTP_HEADER_LEN (macro-ident)",
+    "const RTT (macro-ident)",
+    "const S (macro-ident)",
+    "const S (unresolved-ref)",
+    "const SAMPLE_LEN (macro-ident)",
+    "const SAMPLE_OFFSET_FROM_PN (macro-ident)",
+    "const SCHEMA_VERSION (unresolved-ref)",
+    "const SCID (macro-ident)",
+    "const SECRET (macro-ident)",
+    "const SLOW_DIAL (macro-ident)",
+    "const STAGGER (macro-ident)",
+    "const STREAM_PAUSE_BUDGET (macro-ident)",
+    "const STREAM_PAUSE_RETRY (macro-ident)",
+    "const T0 (macro-ident)",
+    "const TCP_ACK (macro-ident)",
+    "const TCP_SYN (macro-ident)",
+    "const TOKEN_FILE (macro-ident)",
+    "const TUNNEL_DEAD_AFTER (macro-ident)",
+    "const TUNNEL_INTERLEAVE_CHUNK (macro-ident)",
+    "const TUN_READ_BUF_SIZE (macro-ident)",
+    "const T_HAT_LEN (macro-ident)",
+    "const V4_PROBES (macro-ident)",
+    "const V6_PROBES (macro-ident)",
+    "const X25519_MLKEM768_SHARE_LEN (macro-ident)",
+    "enum CaptureError (unresolved-ref)",
+    "enum DgramEngineLabel (unresolved-ref)",
+    "enum EndpointKind (macro-ident)",
+    "enum ExitMode (unresolved-ref)",
+    "enum Family (unresolved-ref)",
+    "enum FrameKind (unresolved-ref)",
+    "enum FrameType (macro-ident)",
+    "enum HandshakeMessage (unresolved-ref)",
+    "enum Insert (unresolved-ref)",
+    "enum LocalProtocol (unresolved-ref)",
+    "enum Message (unresolved-ref)",
+    "enum PcapError (unresolved-ref)",
+    "enum Pick (unresolved-ref)",
+    "enum RawCastEvent (unresolved-ref)",
+    "enum Role (unresolved-ref)",
+    "enum TunnelMode (macro-ident)",
+    "enum TunnelMode (unresolved-ref)",
+    "fn a (macro-ident)",
+    "fn adaptive_write_timeout (macro-ident)",
+    "fn alpn_pair (macro-ident)",
+    "fn analyze (unresolved-ref)",
+    "fn attempt_client_datagram_leg (macro-ident)",
+    "fn authority (macro-ident)",
+    "fn b64_decode (macro-ident)",
+    "fn b64_encode (macro-ident)",
+    "fn backup (macro-ident)",
+    "fn bad (macro-ident)",
+    "fn body (macro-ident)",
+    "fn build_config (macro-ident)",
+    "fn byte_decode_12 (macro-ident)",
+    "fn calls (macro-ident)",
+    "fn can_reach (macro-ident)",
+    "fn cand (macro-ident)",
+    "fn candidate (macro-ident)",
+    "fn cert (macro-ident)",
+    "fn check_attenuation (macro-ident)",
+    "fn cidr_to_mask (macro-ident)",
+    "fn client_endpoint (unresolved-ref)",
+    "fn connection (unresolved-ref)",
+    "fn connection_state (macro-ident)",
+    "fn connection_status_string (uniffi/udl)",
+    "fn count (unresolved-ref)",
+    "fn ct_eq_str (macro-ident)",
+    "fn decide (macro-ident)",
+    "fn decode (macro-ident)",
+    "fn decode_component (macro-ident)",
+    "fn decode_token (macro-ident)",
+    "fn decrypt_descriptor_list (macro-ident)",
+    "fn derive_node_id (macro-ident)",
+    "fn desc_with (macro-ident)",
+    "fn descriptor (macro-ident)",
+    "fn dir (macro-ident)",
+    "fn directory_roles (macro-ident)",
+    "fn dispatch_open_frame (macro-ident)",
+    "fn encode_component (macro-ident)",
+    "fn endorsed (macro-ident)",
+    "fn entry (macro-ident)",
+    "fn ethernet (macro-ident)",
+    "fn expand_counter (macro-ident)",
+    "fn ext_const (macro-ident)",
+    "fn extend_limit (macro-ident)",
+    "fn fingerprint (macro-ident)",
+    "fn first_reachable (macro-ident)",
+    "fn guess_wire_kind (macro-ident)",
+    "fn handle (macro-ident)",
+    "fn handle_server_datagram (macro-ident)",
+    "fn hex (uniffi/udl)",
+    "fn hint (macro-ident)",
+    "fn interleave (macro-ident)",
+    "fn invite (macro-ident)",
+    "fn io_end_kind (macro-ident)",
+    "fn ip (macro-ident)",
+    "fn is_fake_ip (macro-ident)",
+    "fn is_grease (macro-ident)",
+    "fn is_grease_param (macro-ident)",
+    "fn is_local_ip (macro-ident)",
+    "fn is_plausible_hostname (macro-ident)",
+    "fn is_rawcast_connect_frame (macro-ident)",
+    "fn is_safe_cidr (macro-ident)",
+    "fn is_safe_decoy_ip (macro-ident)",
+    "fn is_unreachable_special (macro-ident)",
+    "fn is_valid_interface_name (macro-ident)",
+    "fn issue_token (unresolved-ref)",
+    "fn item (unresolved-ref)",
+    "fn ja3_hash (macro-ident)",
+    "fn ja4 (macro-ident)",
+    "fn key (unresolved-ref)",
+    "fn leg_rtt (macro-ident)",
+    "fn link (macro-ident)",
+    "fn link_type_for_hatype (macro-ident)",
+    "fn live_descriptor (macro-ident)",
+    "fn load_or_create_token (macro-ident)",
+    "fn main (rust-entry-point)",
+    "fn md5_hex (macro-ident)",
+    "fn meshes (macro-ident)",
+    "fn message (unresolved-ref)",
+    "fn minimal (macro-ident)",
+    "fn name_tag (macro-ident)",
+    "fn network_changed (macro-ident)",
+    "fn network_status (macro-ident)",
+    "fn never (macro-ident)",
+    "fn node (uniffi/udl)",
+    "fn node_id_hex (macro-ident)",
+    "fn node_match (macro-ident)",
+    "fn normalize (macro-ident)",
+    "fn now (macro-ident)",
+    "fn ok (unresolved-ref)",
+    "fn open_capsule (macro-ident)",
+    "fn order_candidates (macro-ident)",
+    "fn outbound_samples (unresolved-ref)",
+    "fn pair_proof (macro-ident)",
+    "fn pairwise_secret (macro-ident)",
+    "fn panel_peer (macro-ident)",
+    "fn parse (macro-ident)",
+    "fn parse_mesh_auth_token (macro-ident)",
+    "fn parse_node_id (macro-ident)",
+    "fn parse_specs (macro-ident)",
+    "fn parse_transport_params (macro-ident)",
+    "fn parse_tunnel_mode (macro-ident)",
+    "fn peer (macro-ident)",
+    "fn pick (macro-ident)",
+    "fn pk (unresolved-ref)",
+    "fn pubh (macro-ident)",
+    "fn publish_state (macro-ident)",
+    "fn query_param (macro-ident)",
+    "fn quic_dcid_client (macro-ident)",
+    "fn quic_dcid_server (macro-ident)",
+    "fn rand_hex (macro-ident)",
+    "fn raw (macro-ident)",
+    "fn read_last_good (macro-ident)",
+    "fn read_packets (macro-ident)",
+    "fn read_tcp_socket_stats (macro-ident)",
+    "fn reason (macro-ident)",
+    "fn record (unresolved-ref)",
+    "fn record_lengths (macro-ident)",
+    "fn req (macro-ident)",
+    "fn req (unresolved-ref)",
+    "fn route (unresolved-ref)",
+    "fn run_tcp_bridge (macro-ident)",
+    "fn run_udp_bridge (macro-ident)",
+    "fn sample (macro-ident)",
+    "fn sample_x25519_mlkem768_share (macro-ident)",
+    "fn sanitize_cidrs (macro-ident)",
+    "fn seed (unresolved-ref)",
+    "fn send_mesh_payload (macro-ident)",
+    "fn send_mesh_quic_datagram (macro-ident)",
+    "fn set_tcp_congestion (macro-ident)",
+    "fn shape (unresolved-ref)",
+    "fn shutdown (unresolved-ref)",
+    "fn shutdown_signal (macro-ident)",
+    "fn split_records (macro-ident)",
+    "fn store (macro-ident)",
+    "fn supervisor_action (macro-ident)",
+    "fn sw_token_len_fits (macro-ident)",
+    "fn swarm_key (macro-ident)",
+    "fn syn (macro-ident)",
+    "fn target_family (macro-ident)",
+    "fn tcp_congestion (macro-ident)",
+    "fn tcp_v4 (macro-ident)",
+    "fn throttle_due (macro-ident)",
+    "fn try_acquire_mesh_quic_slot (macro-ident)",
+    "fn tunnel_is_dead (macro-ident)",
+    "fn udp_port_unreachable (macro-ident)",
+    "fn unix_now (macro-ident)",
+    "fn validate_egress (macro-ident)",
+    "fn validate_token (macro-ident)",
+    "fn validate_token_at (macro-ident)",
+    "fn varint (macro-ident)",
+    "fn varint_bytes (macro-ident)",
+    "fn verify (macro-ident)",
+    "fn verify_chain (macro-ident)",
+    "fn webrtc_ssrc_client (macro-ident)",
+    "fn webrtc_ssrc_server (macro-ident)",
+    "mod adapter (unresolved-ref)",
+    "mod auth (macro-ident)",
+    "mod cache (macro-ident)",
+    "mod caps (macro-ident)",
+    "mod client (macro-ident)",
+    "mod config (macro-ident)",
+    "mod connection (unresolved-ref)",
+    "mod control (unresolved-ref)",
+    "mod descriptor (macro-ident)",
+    "mod device (unresolved-ref)",
+    "mod dial (macro-ident)",
+    "mod directory (macro-ident)",
+    "mod directory (unresolved-ref)",
+    "mod egress (unresolved-ref)",
+    "mod endorsements (macro-ident)",
+    "mod error (macro-ident)",
+    "mod fallback (unresolved-ref)",
+    "mod features (macro-ident)",
+    "mod frame (unresolved-ref)",
+    "mod gossip (macro-ident)",
+    "mod health (unresolved-ref)",
+    "mod hybrid (macro-ident)",
+    "mod interface (uniffi/udl)",
+    "mod invite (macro-ident)",
+    "mod legs (macro-ident)",
+    "mod live (macro-ident)",
+    "mod mesh (macro-ident)",
+    "mod mesh (unresolved-ref)",
+    "mod muxer (unresolved-ref)",
+    "mod net (unresolved-ref)",
+    "mod node (uniffi/udl)",
+    "mod peer_session (unresolved-ref)",
+    "mod peers (unresolved-ref)",
+    "mod profile (macro-ident)",
+    "mod profile (unresolved-ref)",
+    "mod quic (macro-ident)",
+    "mod quic (unresolved-ref)",
+    "mod runtime (unresolved-ref)",
+    "mod salt (macro-ident)",
+    "mod server (uniffi/udl)",
+    "mod session (unresolved-ref)",
+    "mod shape (unresolved-ref)",
+    "mod spec (unresolved-ref)",
+    "mod store (unresolved-ref)",
+    "mod tcp (unresolved-ref)",
+    "mod token (unresolved-ref)",
+    "mod transport (macro-ident)",
+    "mod tun (macro-ident)",
+    "mod validator (unresolved-ref)",
+    "static ACTIVE_RECEIVERS (macro-ident)",
+    "static GLOBAL_MIN_RTT (unresolved-ref)",
+    "static GLOBAL_OUTSTANDING (macro-ident)",
+    "static NEXT_CONN_ID (macro-ident)",
+    "struct ApplicationData (unresolved-ref)",
+    "struct Args (unresolved-ref)",
+    "struct BrowserProfile (unresolved-ref)",
+    "struct CaptureLimitStats (unresolved-ref)",
+    "struct Cell (macro-ident)",
+    "struct Challenge (unresolved-ref)",
+    "struct Change (macro-ident)",
+    "struct ChangeCipherSpecMarker (unresolved-ref)",
+    "struct CircuitState (unresolved-ref)",
+    "struct Cli (macro-ident)",
+    "struct ClientHandler (unresolved-ref)",
+    "struct ClientHello (uniffi/udl)",
+    "struct Connection (macro-ident)",
+    "struct DatagramKeyMaterial (unresolved-ref)",
+    "struct DgramKdfContext (unresolved-ref)",
+    "struct Directory (unresolved-ref)",
+    "struct DirectoryConfig (unresolved-ref)",
+    "struct EgressPolicy (unresolved-ref)",
+    "struct EgressRotation (unresolved-ref)",
+    "struct Endorsement (unresolved-ref)",
+    "struct Endpoint (macro-ident)",
+    "struct ExitCaps (unresolved-ref)",
+    "struct ExtId (macro-ident)",
+    "struct FairDataQueue (unresolved-ref)",
+    "struct FileConfig (macro-ident)",
+    "struct HelloHeader (unresolved-ref)",
+    "struct Hex16 (macro-ident)",
+    "struct Invite (unresolved-ref)",
+    "struct LegStats (unresolved-ref)",
+    "struct Live (unresolved-ref)",
+    "struct LoadReport (unresolved-ref)",
+    "struct MeshPeer (macro-ident)",
+    "struct MeshPeerSession (unresolved-ref)",
+    "struct MuxMessage (macro-ident)",
+    "struct NodeDescriptor (unresolved-ref)",
+    "struct PacketSpec (macro-ident)",
+    "struct PeerIdentity (unresolved-ref)",
+    "struct ProfileOptions (unresolved-ref)",
+    "struct Progress (unresolved-ref)",
+    "struct QuicCollector (unresolved-ref)",
+    "struct Raw (unresolved-ref)",
+    "struct RawCastFrame (unresolved-ref)",
+    "struct RawDir (unresolved-ref)",
+    "struct ReaderExit (macro-ident)",
+    "struct ReverseEgressRegistry (unresolved-ref)",
+    "struct Roles (macro-ident)",
+    "struct ServerHandler (macro-ident)",
+    "struct ServerHello (unresolved-ref)",
+    "struct ServerProfile (unresolved-ref)",
+    "struct Session (uniffi/udl)",
+    "struct SessionAuth (unresolved-ref)",
+    "struct SessionKeys (unresolved-ref)",
+    "struct SessionManager (uniffi/udl)",
+    "struct SessionParams (uniffi/udl)",
+    "struct State (unresolved-ref)",
+    "struct Stats (unresolved-ref)",
+    "struct StoreConfig (macro-ident)",
+    "struct Stream (unresolved-ref)",
+    "struct StreamHandler (macro-ident)",
+    "struct StreamStats (unresolved-ref)",
+    "struct SwarmIdentity (unresolved-ref)",
+    "struct SwarmKey (unresolved-ref)",
+    "struct TcpSocketStats (unresolved-ref)",
+    "struct TlsBridge (unresolved-ref)",
+    "struct TlsExtensions (unresolved-ref)",
+    "struct TunnelEngine (macro-ident)",
+    "struct VpnTrafficStats (uniffi/udl)",
+    "struct WriterExit (macro-ident)",
+    "type ChaChaCipher (unresolved-ref)",
+    "type ChaChaStream (unresolved-ref)",
+    "type HmacSha256 (unresolved-ref)"
+  ],
+  "release_build_ok": null,
+  "release_build_tail": "skipped (--emit-only)",
+  "seed": "0x4e455452554e4e45",
+  "src": "/home/kirill/netrunner/netrunner-public",
+  "tests": [],
+  "totals": {
+    "attrs_injected": 432,
+    "format_strings_rewritten": 420,
+    "locals_renamed": 11271,
+    "macro_tokens_rewritten": 4388,
+    "paths_rewritten": 25461,
+    "tier_b_renamed": 299,
+    "uses_rewritten": 935
+  }
+}

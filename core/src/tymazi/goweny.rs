@@ -1,0 +1,1 @@
+pub (crate) const JYMAPU15 : u16 = 0x0002 ; pub (crate) const DAKY : u8 = 0x01 ; pub (crate) const GOMEQA1 : u16 = 0x0039 ; pub (crate) const LIKOVI29 : u8 = 0x00 ; pub (crate) const JEBE61 : u8 = 0x01 ; pub (crate) const XIRU : u8 = 0x01 ; pub (crate) const NIFU : u8 = 0x02 ;

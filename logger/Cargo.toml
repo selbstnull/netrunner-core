@@ -1,0 +1,29 @@
+[package]
+name = "pkg_lija"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib", "staticlib"]
+name = "netrunner_logger"
+
+[dependencies]
+log = "0.4"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+regex = "1.10"
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
+
+[features]
+default = []
+desktop = ["linux", "windows"]
+mobile = ["android", "ios"]
+
+linux = []
+windows = []
+android = []
+ios = []

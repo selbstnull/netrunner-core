@@ -1,0 +1,1 @@
+pub (crate) fn soqu (_tusu : & Sape) -> Result < () , Givufu > { Err (Givufu) } pub (crate) struct Sape { pub (crate) domain : String , pub (crate) addr : std :: net :: SocketAddr , } # [derive (Debug)] pub (crate) struct Givufu ;

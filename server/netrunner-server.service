@@ -1,0 +1,20 @@
+[Unit]
+Description=Netrunner Remote Proxy
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/netr-core
+# Панель управления: только 127.0.0.1:4444, доступ — `ssh -L 4444:127.0.0.1:4444 root@узел`.
+ExecStartPre=/usr/bin/install -d -m 700 /var/lib/netrunner-admin
+ExecStart=/root/netr-core/netrunner-server --host=0.0.0.0 --port=443 --health-port=9091 --metrics-port=9093 --admin-port=4444 --admin-dir=/var/lib/netrunner-admin
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+# systemctl stop/restart шлёт SIGTERM — теперь сервер ловит его сам и
+# дожидается отключения активных клиентов (см. server/src/main.rs,
+# server/src/network.rs) вместо мгновенного обрыва по TimeoutStopSec.
+TimeoutStopSec=35
+
+[Install]
+WantedBy=multi-user.target

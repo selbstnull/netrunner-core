@@ -1,0 +1,1 @@
+use bytes :: BytesMut ; pub trait Sygu { type Error ; fn can_parse (musi : & BytesMut) -> bool ; fn parse (kivo11 : & mut BytesMut) -> Result < Option < Self >, Self :: Error > where Self : Sized ; }
