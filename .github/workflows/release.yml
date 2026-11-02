@@ -1,0 +1,164 @@
+name: Release obfuscated client and server
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub release tag, for example v1.2.3"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+
+    steps:
+      - name: Checkout obfuscated repository
+        uses: actions/checkout@v4
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9][A-Za-z0-9.+_-]*$ ]] || {
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          }
+
+      - name: Install Rust toolchain and Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "ndk;26.1.10909125"
+          ndk_path="$ANDROID_HOME/ndk/26.1.10909125"
+          test -d "$ndk_path"
+          echo "ANDROID_NDK_HOME=$ndk_path" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk_path" >> "$GITHUB_ENV"
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Install cargo-ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cargo-ndk >/dev/null 2>&1; then
+            version=v4.1.2
+            mkdir -p "$HOME/.cargo/bin"
+            curl -fsSL --retry 3 "https://github.com/bbqsrc/cargo-ndk/releases/download/$version/cargo-ndk-x86_64-unknown-linux-gnu-$version.tgz" | tar -xz --strip-components=1 -C "$HOME/.cargo/bin"
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo-ndk" --version
+
+      - name: Test obfuscated workspace
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/netrunner-target
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Build Linux client and server
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/netrunner-target
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path client/Cargo.toml --features cli --bin netrunner-client
+          cargo build --release --locked --manifest-path server/Cargo.toml --bin netrunner-server
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          install -m 0755 "$CARGO_TARGET_DIR/release/netrunner-client" "$RUNNER_TEMP/release-assets/netrunner-client-linux-x86_64"
+          install -m 0755 "$CARGO_TARGET_DIR/release/netrunner-server" "$RUNNER_TEMP/release-assets/netrunner-server-linux-x86_64"
+
+      - name: Build Android client and logger libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/android-libs"
+          mkdir -p "$output"
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            target="$RUNNER_TEMP/target-android/$abi"
+            CARGO_TARGET_DIR="$target" cargo ndk -t "$abi" -o "$output" build --release --locked --manifest-path client/Cargo.toml --lib
+            CARGO_TARGET_DIR="$target" cargo ndk -t "$abi" -o "$output" build --release --locked --manifest-path logger/Cargo.toml --lib
+            test -s "$output/$abi/libnetrunner_client.so"
+            test -s "$output/$abi/libnetrunner_logger.so"
+          done
+
+      - name: Generate Kotlin bindings and package Android libraries
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/bindgen-target
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/android-libs"
+          bindings="$RUNNER_TEMP/uniffi-bindings"
+          package="$RUNNER_TEMP/android-package"
+          assets="$RUNNER_TEMP/release-assets"
+          cargo run --release --manifest-path tools/bindgen/Cargo.toml -- generate --library "$output/arm64-v8a/libnetrunner_client.so" --language kotlin --no-format --out-dir "$bindings"
+          test -s "$bindings/uniffi/netrunner_client/netrunner_client.kt"
+          mkdir -p "$package/java/uniffi"
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            mkdir -p "$package/jniLibs/$abi"
+            cp "$output/$abi/libnetrunner_client.so" "$output/$abi/libnetrunner_logger.so" "$package/jniLibs/$abi/"
+          done
+          cp -R "$bindings/uniffi/netrunner_client" "$package/java/uniffi/"
+          tar -czf "$assets/netrunner-client-android-libs.tar.gz" -C "$package" jniLibs java
+
+      - name: Add release metadata and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/release-assets"
+          cat > "$assets/BUILD-INFO.txt" <<EOF
+          Release: $RELEASE_TAG
+          Obfuscated repository: $GITHUB_REPOSITORY
+          Obfuscated commit: $GITHUB_SHA
+          Android ABIs: arm64-v8a, armeabi-v7a, x86_64, x86
+          Linux binaries: netrunner-client, netrunner-server
+          EOF
+          (cd "$assets" && sha256sum netrunner-* BUILD-INFO.txt > SHA256SUMS)
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/release-assets"
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --title "Netrunner $RELEASE_TAG" --notes-file "$assets/BUILD-INFO.txt"
+          fi
+          gh release upload "$RELEASE_TAG" "$assets"/* --clobber
